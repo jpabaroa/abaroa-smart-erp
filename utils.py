@@ -44,7 +44,7 @@ def logo(width=200):
 
 # ── TEMA PREMIUM ──────────────────────────────────────────────────────────────
 def apply_theme():
-    st.markdown("""
+    st.html("""
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
 
@@ -649,7 +649,7 @@ def apply_theme():
     }
 
     </style>
-    """, unsafe_allow_html=True)
+    """)
 
 
 # ── Componentes HTML ──────────────────────────────────────────────────────────

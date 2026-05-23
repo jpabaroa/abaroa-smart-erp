@@ -28,16 +28,16 @@ if "sidebar_open"   not in st.session_state: st.session_state["sidebar_open"]   
 # ── CSS sidebar open/close ────────────────────────────────────────────────────
 def inject_sidebar_css(open_=True):
     if open_:
-        st.markdown("""
+        st.html("""
         <style>
         [data-testid="collapsedControl"] { display:none !important; }
         section[data-testid="stSidebar"] {
             width:17rem !important; min-width:17rem !important;
             transform:translateX(0) !important; opacity:1 !important; visibility:visible !important;
         }
-        </style>""", unsafe_allow_html=True)
+        </style>""")
     else:
-        st.markdown("""
+        st.html("""
         <style>
         [data-testid="collapsedControl"] { display:none !important; }
         section[data-testid="stSidebar"] {
@@ -46,7 +46,7 @@ def inject_sidebar_css(open_=True):
             opacity:0 !important; visibility:hidden !important;
         }
         [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
-        </style>""", unsafe_allow_html=True)
+        </style>""")
 
 inject_sidebar_css(st.session_state.get("sidebar_open", True))
 
