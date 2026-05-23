@@ -30,22 +30,42 @@ def inject_sidebar_css(open_=True):
     if open_:
         st.html("""
         <style>
-        [data-testid="collapsedControl"] { display:none !important; }
-        section[data-testid="stSidebar"] {
-            width:17rem !important; min-width:17rem !important;
-            transform:translateX(0) !important; opacity:1 !important; visibility:visible !important;
+        /* Desktop: sidebar visible */
+        @media (min-width: 769px) {
+            [data-testid="collapsedControl"] { display:none !important; }
+            section[data-testid="stSidebar"] {
+                width:17rem !important; min-width:17rem !important;
+                transform:translateX(0) !important; opacity:1 !important; visibility:visible !important;
+            }
+        }
+        /* Móvil: Streamlit maneja el sidebar nativamente (overlay) */
+        @media (max-width: 768px) {
+            [data-testid="collapsedControl"] { display:flex !important; }
+            section[data-testid="stSidebar"] {
+                width:80vw !important; max-width:300px !important;
+            }
         }
         </style>""")
     else:
         st.html("""
         <style>
-        [data-testid="collapsedControl"] { display:none !important; }
-        section[data-testid="stSidebar"] {
-            width:0 !important; min-width:0 !important; max-width:0 !important;
-            overflow:hidden !important; transform:translateX(-100%) !important;
-            opacity:0 !important; visibility:hidden !important;
+        /* Desktop: sidebar oculto */
+        @media (min-width: 769px) {
+            [data-testid="collapsedControl"] { display:none !important; }
+            section[data-testid="stSidebar"] {
+                width:0 !important; min-width:0 !important; max-width:0 !important;
+                overflow:hidden !important; transform:translateX(-100%) !important;
+                opacity:0 !important; visibility:hidden !important;
+            }
+            [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
         }
-        [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
+        /* Móvil: Streamlit maneja el sidebar nativamente */
+        @media (max-width: 768px) {
+            [data-testid="collapsedControl"] { display:flex !important; }
+            section[data-testid="stSidebar"] {
+                width:80vw !important; max-width:300px !important;
+            }
+        }
         </style>""")
 
 inject_sidebar_css(st.session_state.get("sidebar_open", True))

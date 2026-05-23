@@ -636,7 +636,22 @@ def apply_theme():
         .hero-title { font-size: 1.2rem; }
         .kpi-value  { font-size: 1.3rem; }
         .kpi-card   { min-height: 85px; padding: .75rem .9rem; border-radius: 14px; }
-        section[data-testid="stSidebar"] { width: 80vw !important; max-width: 300px !important; }
+
+        /* Sidebar móvil: cajón tipo overlay, Streamlit lo controla */
+        section[data-testid="stSidebar"] {
+            width: 82vw !important; max-width: 300px !important;
+            position: fixed !important;
+            top: 0 !important; left: 0 !important; bottom: 0 !important;
+            z-index: 999 !important;
+        }
+        /* Botón nativo de Streamlit visible en móvil */
+        [data-testid="collapsedControl"] {
+            display: flex !important;
+            position: fixed !important;
+            top: .5rem !important; left: .5rem !important;
+            z-index: 1000 !important;
+        }
+
         div[data-testid="stDataFrame"] { overflow-x: auto; -webkit-overflow-scrolling: touch; }
         div[data-testid="stDownloadButton"] button { width: 100% !important; }
         .hero-banner::before { display: none; }
