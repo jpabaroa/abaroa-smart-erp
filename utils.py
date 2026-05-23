@@ -509,11 +509,14 @@ def apply_theme():
         margin-bottom: .5rem !important;
     }
     div[data-testid="stExpander"] summary {
-        font-family: 'Outfit', sans-serif !important;
         font-weight: 600 !important;
         color: #94a3b8 !important;
         font-size: .88rem !important;
         padding: .75rem 1rem !important;
+    }
+    /* Solo el texto del summary, sin tocar el ícono de flecha */
+    div[data-testid="stExpander"] summary span:last-child {
+        font-family: 'Outfit', sans-serif !important;
     }
     div[data-testid="stExpander"] summary:hover { color: #e2e8f0 !important; }
 
