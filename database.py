@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);
 
 CREATE TABLE IF NOT EXISTS clients (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL, phone TEXT, email TEXT, address TEXT
+    name TEXT NOT NULL, phone TEXT, email TEXT, address TEXT,
+    rut TEXT DEFAULT '', notes TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS vendors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,6 +202,21 @@ def init_db():
     conn = get_conn()
     conn.executescript(_SCHEMA)
     conn.commit()
+    conn.close()
+
+def migrate_db():
+    """Agrega columnas nuevas a tablas existentes sin perder datos."""
+    migrations = [
+        ("clients", "rut",   "TEXT DEFAULT ''"),
+        ("clients", "notes", "TEXT DEFAULT ''"),
+    ]
+    conn = get_conn()
+    for table, col, col_def in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+            conn.commit()
+        except Exception:
+            pass  # Columna ya existe, ignorar
     conn.close()
 
 def remove_duplicate_rows():
