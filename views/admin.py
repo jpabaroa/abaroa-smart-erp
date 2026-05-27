@@ -1,7 +1,7 @@
 import streamlit as st
 from database import (get_setting, set_setting, hash_password, verify_admin_credentials,
                       admin_logged_in, list_backups, APP_DIR, DB_PATH,
-                      delete_project_and_reset_stock, get_df)
+                      delete_project_and_reset_stock, reset_transactional_data, get_df)
 
 def render():
     st.subheader("Administración")
@@ -21,7 +21,7 @@ def render():
         return
 
     st.success(f"Sesión activa: **{get_setting('admin_username','admin')}**")
-    t1, t2, t3 = st.tabs(["Credenciales","Mantenimiento","Datos de prueba"])
+    t1, t2, t3 = st.tabs(["Credenciales","Mantenimiento","Reset de pruebas"])
     with t1:
         c1, c2 = st.columns(2)
         with c1:
@@ -63,8 +63,38 @@ def render():
             exports = list(APP_DIR.glob("export_abaroa_smart_*.json"))
             st.write(f"Exportaciones JSON: {len(exports)}")
     with t3:
-        st.markdown("### Eliminar proyecto de prueba")
-        st.caption("Elimina un proyecto junto con su OT y cotización vinculadas, restaurando el stock reservado. Útil para limpiar datos de prueba y empezar desde cero.")
+        st.markdown("### Reset total de datos de prueba")
+        st.caption(
+            "Borra **todos** los registros transaccionales: clientes, cotizaciones, proyectos, "
+            "OT, ventas, facturación, movimientos de inventario y proveedores. "
+            "Preserva inventario, kits, vendedores, plantillas de checklist y configuración. "
+            "El stock de cada ítem vuelve a su valor de stock inicial."
+        )
+        st.warning("⚠️ Esta acción es irreversible. Asegúrate de tener un respaldo antes de continuar.")
+
+        confirm1 = st.checkbox("Entiendo que se borrarán todos los datos transaccionales.", key="reset_confirm1")
+        confirm2 = st.checkbox("He hecho un respaldo de la base de datos.", key="reset_confirm2")
+
+        if st.button("🗑️ Ejecutar reset de pruebas", type="primary",
+                     disabled=not (confirm1 and confirm2), key="btn_full_reset"):
+            ok, msg, detalle = reset_transactional_data()
+            if ok:
+                st.success(f"✅ {msg}")
+                rows = []
+                for tabla, count in detalle.items():
+                    if tabla == "inventory_reset":
+                        rows.append({"Tabla": "inventory", "Resultado": str(count)})
+                    else:
+                        rows.append({"Tabla": tabla, "Resultado": f"{count} filas eliminadas" if isinstance(count, int) else str(count)})
+                import pandas as pd
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.rerun()
+            else:
+                st.error(msg)
+
+        st.markdown("---")
+        st.markdown("### Eliminar un proyecto específico")
+        st.caption("Elimina un proyecto puntual junto con su OT y cotización vinculadas, restaurando el stock.")
         projects_df = get_df("""
             SELECT p.id, p.project_number, p.status, c.name AS cliente, qt.quote_number
             FROM projects p
@@ -75,33 +105,21 @@ def render():
         if projects_df.empty:
             st.info("No hay proyectos en la base de datos.")
         else:
-            proj_opts = [
-                f'{int(r["id"])} · {r["project_number"]} · {r["cliente"]} · {r["status"]}'
-                for _, r in projects_df.iterrows()
-            ]
-            sel_proj = st.selectbox("Seleccionar proyecto a eliminar", proj_opts, key="admin_del_proj")
+            proj_opts = [f'{int(r["id"])} · {r["project_number"]} · {r["cliente"]} · {r["status"]}' for _, r in projects_df.iterrows()]
+            sel_proj = st.selectbox("Proyecto a eliminar", proj_opts, key="admin_del_proj")
             proj_id = int(sel_proj.split(" · ")[0]) if sel_proj else None
-
-            # Mostrar detalle del proyecto seleccionado
             if proj_id:
                 row = projects_df[projects_df["id"] == proj_id].iloc[0]
-                st.info(f"**Proyecto:** {row['project_number']}  ·  **Cotización vinculada:** {row.get('quote_number','—')}  ·  **Estado:** {row['status']}")
-
-            confirm = st.checkbox(
-                "Confirmo que quiero eliminar este proyecto, su OT y su cotización, y restaurar el stock reservado.",
-                key="admin_del_proj_confirm"
-            )
-            if st.button("🗑️ Eliminar proyecto de prueba", type="primary", disabled=not confirm, key="admin_del_proj_btn"):
+                st.info(f"**Proyecto:** {row['project_number']}  ·  **Cotización:** {row.get('quote_number','—')}  ·  **Estado:** {row['status']}")
+            confirm_one = st.checkbox("Confirmo que quiero eliminar este proyecto y sus registros vinculados.", key="admin_del_proj_confirm")
+            if st.button("🗑️ Eliminar proyecto", type="primary", disabled=not confirm_one, key="admin_del_proj_btn"):
                 if proj_id:
                     ok, msg, detalle = delete_project_and_reset_stock(proj_id)
                     if ok:
                         lines = [f"✅ {msg}"]
-                        if detalle.get("cotizacion"):
-                            lines.append(f"• Cotización eliminada: **{detalle['cotizacion']}**")
-                        if detalle.get("ot"):
-                            lines.append(f"• OT eliminada: **{detalle['ot']}**")
-                        if detalle.get("stock_liberado"):
-                            lines.append("• Stock restaurado: " + ", ".join(detalle["stock_liberado"]))
+                        if detalle.get("cotizacion"): lines.append(f"• Cotización: **{detalle['cotizacion']}**")
+                        if detalle.get("ot"):         lines.append(f"• OT: **{detalle['ot']}**")
+                        if detalle.get("stock_liberado"): lines.append("• Stock restaurado: " + ", ".join(detalle["stock_liberado"]))
                         st.success("\n".join(lines))
                         st.rerun()
                     else:
