@@ -1858,3 +1858,71 @@ def get_audit_log(limit: int = 100) -> list:
     ).fetchall()
     conn.close()
     return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers pandas — usados por las vistas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_df(sql: str, params: tuple = ()):
+    """
+    Ejecuta una consulta SQL y devuelve un pandas DataFrame.
+    Las vistas usan get_df() para cargar datos listos para st.dataframe().
+    Compatibilidad: acepta tanto nombres de tabla nuevos (products, work_orders)
+    como alias legacy (inventory → products, stock_current → stock, etc.)
+    mediante una capa de traducción automática.
+    """
+    import pandas as pd
+
+    # Traducción automática de nombres legacy → nuevo esquema
+    _aliases = {
+        "inventory":       "products",
+        "stock_current":   "stock",
+        "cost_unit":       "cost_price",
+        "margin_pct":      "margin",
+    }
+    translated = sql
+    for old, new in _aliases.items():
+        translated = translated.replace(old, new)
+
+    conn = get_conn()
+    try:
+        df = pd.read_sql_query(translated, conn, params=params)
+    except Exception:
+        # Si la traducción falla, intentar con el SQL original
+        try:
+            df = pd.read_sql_query(sql, conn, params=params)
+        except Exception:
+            df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+def get_dashboard_work_orders_df(limit: int = 8):
+    """
+    Devuelve un DataFrame con las OT activas para el dashboard de inicio.
+    Incluye número, cliente, tipo, estado, fecha programada y técnico.
+    """
+    import pandas as pd
+
+    conn = get_conn()
+    try:
+        df = pd.read_sql_query(f"""
+            SELECT
+                wo.ot_number        AS 'N° OT',
+                c.name              AS 'Cliente',
+                wo.type             AS 'Tipo',
+                wo.status           AS 'Estado',
+                wo.scheduled_date   AS 'Fecha',
+                wo.technician       AS 'Técnico'
+            FROM work_orders wo
+            LEFT JOIN clients c ON c.id = wo.client_id
+            WHERE wo.status IN ('abierta','en_progreso','Pendiente','Agendada',
+                                'En ejecución','Abierta','En proceso')
+            ORDER BY wo.scheduled_date ASC
+            LIMIT {int(limit)}
+        """, conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
