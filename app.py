@@ -13,7 +13,7 @@ CORRECCIONES v2:
 import streamlit as st
 from utils import apply_theme, logo
 from database import (
-    init_db, ensure_app_settings, recalc_all_sale_prices, recalc_stock,
+    init_db, migrate_db, ensure_app_settings, recalc_all_sale_prices, recalc_stock,
     remove_duplicate_rows, get_alerts_data, admin_logged_in,
     verify_admin_credentials, get_setting,
 )
@@ -27,6 +27,7 @@ st.set_page_config(
 )
 apply_theme()
 init_db()
+migrate_db()
 ensure_app_settings()
 remove_duplicate_rows()
 recalc_all_sale_prices()
