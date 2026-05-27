@@ -465,6 +465,10 @@ def init_db():
 # Configuración / Settings
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _hash_password(plain: str) -> str:
+    return hashlib.sha256(plain.encode()).hexdigest()
+
+
 _DEFAULT_SETTINGS = {
     "company_name":     "Abaroa Smart",
     "company_rut":      "",
@@ -486,17 +490,10 @@ _DEFAULT_SETTINGS = {
 }
 
 
-def _hash_password(plain: str) -> str:
-    return hashlib.sha256(plain.encode()).hexdigest()
-
-
 def ensure_app_settings():
     """Inserta valores por defecto solo si la clave no existe."""
     conn = get_conn()
     defaults = dict(_DEFAULT_SETTINGS)
-    # La clave admin_password puede no estar en _DEFAULT_SETTINGS con hash real
-    # porque la función _hash_password no es accesible en la definición del dict.
-    # Recalculamos:
     defaults["admin_password"] = _hash_password("admin123")
     for key, value in defaults.items():
         conn.execute(
