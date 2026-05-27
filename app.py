@@ -1,6 +1,13 @@
 """
 app.py — Abaroa Smart ERP
 Entry point: configuración, tema premium, sidebar y despachador de vistas.
+
+CORRECCIONES v2:
+  - inject_sidebar_css: st.html() → st.markdown(unsafe_allow_html=True) para que
+    el CSS realmente aplique a la página (st.html crea un iframe aislado en Streamlit ≥1.36)
+  - render_header: eliminado parámetro value= en st.text_input que causaba
+    StreamlitAPIException cuando global_search ya existía en session_state
+  - CSS sidebar móvil: mejorado para landscape y pantallas pequeñas
 """
 
 import streamlit as st
@@ -12,8 +19,12 @@ from database import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Abaroa Smart ERP", layout="wide", page_icon="💡")
-
+st.set_page_config(
+    page_title="Abaroa Smart ERP",
+    layout="wide",
+    page_icon="💡",
+    initial_sidebar_state="expanded",
+)
 apply_theme()
 init_db()
 ensure_app_settings()
@@ -22,53 +33,97 @@ recalc_all_sale_prices()
 recalc_stock()
 
 # ── Session state ─────────────────────────────────────────────────────────────
-if "current_tab"    not in st.session_state: st.session_state["current_tab"]    = "Inicio"
-if "sidebar_open"   not in st.session_state: st.session_state["sidebar_open"]   = True
+if "current_tab"   not in st.session_state: st.session_state["current_tab"]   = "Inicio"
+if "sidebar_open"  not in st.session_state: st.session_state["sidebar_open"]  = True
+if "global_search" not in st.session_state: st.session_state["global_search"] = ""
 
 # ── CSS sidebar open/close ────────────────────────────────────────────────────
-def inject_sidebar_css(open_=True):
+# FIX: usar st.markdown() en lugar de st.html() para que los estilos apliquen
+# globalmente. st.html() en Streamlit ≥1.36 renderiza en un <iframe> aislado
+# y el CSS nunca sale de ese iframe.
+
+def inject_sidebar_css(open_: bool = True):
     if open_:
-        st.html("""
-        <style>
-        /* Desktop: sidebar visible */
+        css = """
+        /* ─── DESKTOP: sidebar visible ─────────────────── */
         @media (min-width: 769px) {
             [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
                 width:17rem !important; min-width:17rem !important;
-                transform:translateX(0) !important; opacity:1 !important; visibility:visible !important;
+                transform:translateX(0) !important;
+                opacity:1 !important; visibility:visible !important;
+                transition: transform .25s ease, opacity .2s ease;
             }
         }
-        /* Móvil: Streamlit maneja el sidebar nativamente (overlay) */
+        /* ─── MÓVIL: overlay nativo + nuestro toggle ───── */
         @media (max-width: 768px) {
-            [data-testid="collapsedControl"] { display:flex !important; }
+            [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
-                width:80vw !important; max-width:300px !important;
+                position:fixed !important;
+                top:0 !important; left:0 !important; bottom:0 !important;
+                height:100dvh !important;
+                width:85vw !important; max-width:320px !important;
+                z-index:9999 !important;
+                transform:translateX(0) !important;
+                opacity:1 !important; visibility:visible !important;
+                box-shadow:4px 0 24px rgba(0,0,0,.5) !important;
+                transition: transform .25s ease;
             }
         }
-        </style>""")
+        /* ─── LANDSCAPE MÓVIL (<= 768px altura) ────────── */
+        @media (max-height: 500px) and (orientation: landscape) {
+            section[data-testid="stSidebar"] {
+                position:fixed !important;
+                top:0 !important; left:0 !important; bottom:0 !important;
+                height:100dvh !important;
+                width:260px !important;
+                z-index:9999 !important;
+                transform:translateX(0) !important;
+                overflow-y:auto !important;
+            }
+        }
+        """
     else:
-        st.html("""
-        <style>
-        /* Desktop: sidebar oculto */
+        css = """
+        /* ─── DESKTOP: sidebar oculto ──────────────────── */
         @media (min-width: 769px) {
             [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
                 width:0 !important; min-width:0 !important; max-width:0 !important;
-                overflow:hidden !important; transform:translateX(-100%) !important;
+                overflow:hidden !important;
+                transform:translateX(-100%) !important;
                 opacity:0 !important; visibility:hidden !important;
+                transition: transform .25s ease, opacity .2s ease;
             }
             [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
         }
-        /* Móvil: Streamlit maneja el sidebar nativamente */
+        /* ─── MÓVIL: sidebar oculto (fuera de pantalla) ── */
         @media (max-width: 768px) {
-            [data-testid="collapsedControl"] { display:flex !important; }
+            [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
-                width:80vw !important; max-width:300px !important;
+                position:fixed !important;
+                top:0 !important; left:0 !important; bottom:0 !important;
+                height:100dvh !important;
+                width:85vw !important; max-width:320px !important;
+                z-index:9999 !important;
+                transform:translateX(-110%) !important;
+                opacity:0 !important; visibility:hidden !important;
+                transition: transform .25s ease, opacity .2s ease;
             }
         }
-        </style>""")
+        /* ─── LANDSCAPE MÓVIL ───────────────────────────── */
+        @media (max-height: 500px) and (orientation: landscape) {
+            section[data-testid="stSidebar"] {
+                transform:translateX(-110%) !important;
+                opacity:0 !important; visibility:hidden !important;
+            }
+        }
+        """
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
 
 inject_sidebar_css(st.session_state.get("sidebar_open", True))
+
 
 # ── HEADER ────────────────────────────────────────────────────────────────────
 def render_header():
@@ -82,9 +137,15 @@ def render_header():
             st.rerun()
 
     with h2:
-        st.text_input("Buscar", value=st.session_state.get("global_search",""),
-                      key="global_search", label_visibility="collapsed",
-                      placeholder="🔎  Buscar clientes, SKU, OT...")
+        # FIX: no pasar value= junto con key= apuntando al mismo session_state.
+        # Streamlit lanza StreamlitAPIException si la clave ya existe en session_state
+        # y además se pasa value=. Solo se usa key= y Streamlit gestiona el valor.
+        st.text_input(
+            "Buscar",
+            key="global_search",
+            label_visibility="collapsed",
+            placeholder="🔎 Buscar clientes, SKU, OT...",
+        )
 
     with h3:
         quick = [("Inicio","🏠"), ("Cotización","🧾"), ("Inventario","📦"), ("Proyectos","🛠️"), ("OT","📋")]
@@ -93,11 +154,12 @@ def render_header():
             with col:
                 btype = "primary" if current_tab == tab else "secondary"
                 if st.button(f"{icon} {tab}", key=f"hq_{tab}", use_container_width=True, type=btype):
-                    st.session_state["current_tab"] = tab; st.rerun()
+                    st.session_state["current_tab"] = tab
+                    st.rerun()
 
     with h4:
         alerts = get_alerts_data()
-        bell = f"🔔 {len(alerts)}" if alerts else "🔔"
+        bell   = f"🔔 {len(alerts)}" if alerts else "🔔"
         with st.popover(bell, use_container_width=True):
             st.markdown("**Alertas del sistema**")
             if alerts:
@@ -112,15 +174,18 @@ def render_header():
             if admin_logged_in():
                 st.success(f"**{get_setting('admin_username','admin')}**")
                 if st.button("Panel admin", key="hdr_admin_go"):
-                    st.session_state["current_tab"] = "Administración"; st.rerun()
+                    st.session_state["current_tab"] = "Administración"
+                    st.rerun()
                 if st.button("Cerrar sesión", key="hdr_logout"):
-                    st.session_state["admin_logged_in"] = False; st.rerun()
+                    st.session_state["admin_logged_in"] = False
+                    st.rerun()
             else:
-                pu = st.text_input("Usuario", key="hdr_user")
+                pu = st.text_input("Usuario",    key="hdr_user")
                 pp = st.text_input("Contraseña", type="password", key="hdr_pass")
                 if st.button("Ingresar", key="hdr_login"):
                     if verify_admin_credentials(pu, pp):
-                        st.session_state["admin_logged_in"] = True; st.rerun()
+                        st.session_state["admin_logged_in"] = True
+                        st.rerun()
                     else:
                         st.error("Credenciales incorrectas.")
                 st.caption("Default: admin / admin123")
@@ -128,10 +193,10 @@ def render_header():
     # Breadcrumb
     st.markdown(f"""
     <div class="app-header">
-        <div>
-            <div class="app-header-module">Abaroa Smart ERP</div>
-            <div class="app-header-title">{current_tab}</div>
-        </div>
+      <div>
+        <div class="app-header-module">Abaroa Smart ERP</div>
+        <div class="app-header-title">{current_tab}</div>
+      </div>
     </div>""", unsafe_allow_html=True)
 
 
@@ -139,33 +204,39 @@ def render_header():
 def render_sidebar():
     if not st.session_state.get("sidebar_open", True):
         return
+
     nav = {
-        "Principal":   [("Inicio","🏠 Inicio"), ("Flujo Guiado","🧭 Flujo Guiado"), ("Buscador","🔎 Buscador")],
-        "Operación":   [("Proyectos","🛠️ Proyectos"), ("OT","📋 OT"), ("Garantías","🛡️ Garantías")],
-        "Comercial":   [("Cotización","🧾 Cotización"), ("Historial Cotizaciones","📚 Historial"), ("Ventas","💳 Ventas"), ("Facturación","🧮 Facturación")],
-        "Inventario":  [("Inventario","📦 Inventario"), ("Herramientas","🔧 Herramientas"), ("Insumos","🧰 Insumos"), ("Kits","🧩 Kits"), ("Proveedores","🚚 Proveedores")],
-        "CRM":         [("Clientes","👤 Clientes"), ("Vendedores","🤝 Vendedores")],
-        "Sistema":     [("Respaldo y Restauración","⚙️ Respaldos"), ("Administración","🔐 Admin")],
+        "Principal":  [("Inicio","🏠 Inicio"), ("Flujo Guiado","🧭 Flujo Guiado"), ("Buscador","🔎 Buscador")],
+        "Operación":  [("Proyectos","🛠️ Proyectos"), ("OT","📋 OT"), ("Garantías","🛡️ Garantías")],
+        "Comercial":  [("Cotización","🧾 Cotización"), ("Historial Cotizaciones","📚 Historial"),
+                       ("Ventas","💳 Ventas"), ("Facturación","🧮 Facturación")],
+        "Inventario": [("Inventario","📦 Inventario"), ("Herramientas","🔧 Herramientas"),
+                       ("Insumos","🧰 Insumos"), ("Kits","🧩 Kits"), ("Proveedores","🚚 Proveedores")],
+        "CRM":        [("Clientes","👤 Clientes"), ("Vendedores","🤝 Vendedores")],
+        "Sistema":    [("Respaldo y Restauración","⚙️ Respaldos"), ("Administración","🔐 Admin")],
     }
+
     with st.sidebar:
         st.markdown("""
         <div class="sidebar-brand">
-            <div class="sidebar-brand-logo">Abaroa<span>Smart</span></div>
-            <div class="sidebar-brand-sub">ERP Operativo</div>
+          <div class="sidebar-brand-logo">Abaroa<span>Smart</span></div>
+          <div class="sidebar-brand-sub">ERP Operativo</div>
         </div>""", unsafe_allow_html=True)
-        current = st.session_state.get("current_tab","Inicio")
+
+        current = st.session_state.get("current_tab", "Inicio")
         for section, items in nav.items():
             st.markdown(f'<div class="sidebar-section">{section}</div>', unsafe_allow_html=True)
             for tab_key, tab_label in items:
                 btype = "primary" if current == tab_key else "secondary"
                 if st.button(tab_label, key=f"nav_{tab_key}", use_container_width=True, type=btype):
-                    st.session_state["current_tab"] = tab_key; st.rerun()
+                    st.session_state["current_tab"] = tab_key
+                    st.rerun()
 
 
 # ── Render ────────────────────────────────────────────────────────────────────
 render_header()
 render_sidebar()
-current_tab = st.session_state.get("current_tab","Inicio")
+current_tab = st.session_state.get("current_tab", "Inicio")
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 _views = {
