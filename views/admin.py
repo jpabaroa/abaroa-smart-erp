@@ -71,27 +71,19 @@ def render():
             "El stock de cada ítem vuelve a su valor de stock inicial."
         )
         st.warning("⚠️ Esta acción es irreversible. Asegúrate de tener un respaldo antes de continuar.")
-
         confirm1 = st.checkbox("Entiendo que se borrarán todos los datos transaccionales.", key="reset_confirm1")
         confirm2 = st.checkbox("He hecho un respaldo de la base de datos.", key="reset_confirm2")
-
         if st.button("🗑️ Ejecutar reset de pruebas", type="primary",
                      disabled=not (confirm1 and confirm2), key="btn_full_reset"):
             ok, msg, detalle = reset_transactional_data()
             if ok:
                 st.success(f"✅ {msg}")
-                rows = []
-                for tabla, count in detalle.items():
-                    if tabla == "inventory_reset":
-                        rows.append({"Tabla": "inventory", "Resultado": str(count)})
-                    else:
-                        rows.append({"Tabla": tabla, "Resultado": f"{count} filas eliminadas" if isinstance(count, int) else str(count)})
                 import pandas as pd
+                rows = [{"Tabla": k, "Resultado": f"{v} filas eliminadas" if isinstance(v, int) else str(v)} for k,v in detalle.items()]
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                 st.rerun()
             else:
                 st.error(msg)
-
         st.markdown("---")
         st.markdown("### Eliminar un proyecto específico")
         st.caption("Elimina un proyecto puntual junto con su OT y cotización vinculadas, restaurando el stock.")
