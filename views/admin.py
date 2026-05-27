@@ -1,6 +1,7 @@
 import streamlit as st
 from database import (get_setting, set_setting, hash_password, verify_admin_credentials,
-                      admin_logged_in, list_backups, APP_DIR, DB_PATH)
+                      admin_logged_in, list_backups, APP_DIR, DB_PATH,
+                      delete_project_and_reset_stock, get_df)
 
 def render():
     st.subheader("Administración")
@@ -20,7 +21,7 @@ def render():
         return
 
     st.success(f"Sesión activa: **{get_setting('admin_username','admin')}**")
-    t1, t2 = st.tabs(["Credenciales","Mantenimiento"])
+    t1, t2, t3 = st.tabs(["Credenciales","Mantenimiento","Datos de prueba"])
     with t1:
         c1, c2 = st.columns(2)
         with c1:
@@ -61,3 +62,47 @@ def render():
             st.write(f"Respaldos detectados: {len(list_backups())}")
             exports = list(APP_DIR.glob("export_abaroa_smart_*.json"))
             st.write(f"Exportaciones JSON: {len(exports)}")
+    with t3:
+        st.markdown("### Eliminar proyecto de prueba")
+        st.caption("Elimina un proyecto junto con su OT y cotización vinculadas, restaurando el stock reservado. Útil para limpiar datos de prueba y empezar desde cero.")
+        projects_df = get_df("""
+            SELECT p.id, p.project_number, p.status, c.name AS cliente, qt.quote_number
+            FROM projects p
+            LEFT JOIN clients c ON c.id=p.client_id
+            LEFT JOIN quotes qt ON qt.id=p.quotation_id
+            ORDER BY p.id DESC
+        """)
+        if projects_df.empty:
+            st.info("No hay proyectos en la base de datos.")
+        else:
+            proj_opts = [
+                f'{int(r["id"])} · {r["project_number"]} · {r["cliente"]} · {r["status"]}'
+                for _, r in projects_df.iterrows()
+            ]
+            sel_proj = st.selectbox("Seleccionar proyecto a eliminar", proj_opts, key="admin_del_proj")
+            proj_id = int(sel_proj.split(" · ")[0]) if sel_proj else None
+
+            # Mostrar detalle del proyecto seleccionado
+            if proj_id:
+                row = projects_df[projects_df["id"] == proj_id].iloc[0]
+                st.info(f"**Proyecto:** {row['project_number']}  ·  **Cotización vinculada:** {row.get('quote_number','—')}  ·  **Estado:** {row['status']}")
+
+            confirm = st.checkbox(
+                "Confirmo que quiero eliminar este proyecto, su OT y su cotización, y restaurar el stock reservado.",
+                key="admin_del_proj_confirm"
+            )
+            if st.button("🗑️ Eliminar proyecto de prueba", type="primary", disabled=not confirm, key="admin_del_proj_btn"):
+                if proj_id:
+                    ok, msg, detalle = delete_project_and_reset_stock(proj_id)
+                    if ok:
+                        lines = [f"✅ {msg}"]
+                        if detalle.get("cotizacion"):
+                            lines.append(f"• Cotización eliminada: **{detalle['cotizacion']}**")
+                        if detalle.get("ot"):
+                            lines.append(f"• OT eliminada: **{detalle['ot']}**")
+                        if detalle.get("stock_liberado"):
+                            lines.append("• Stock restaurado: " + ", ".join(detalle["stock_liberado"]))
+                        st.success("\n".join(lines))
+                        st.rerun()
+                    else:
+                        st.error(msg)
