@@ -73,7 +73,7 @@ def apply_theme():
 
     # ── Google Fonts: se carga via st.markdown (solo un <link>, no CSS real)
     st.markdown(
-        '<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">',
+        '<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Material+Symbols+Sharp:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=swap" rel="stylesheet">',
         unsafe_allow_html=True,
     )
 
@@ -102,6 +102,35 @@ header[data-testid="stHeader"] { display:none !important; }
 [data-testid="stToolbar"]       { display:none !important; }
 #MainMenu, footer               { visibility:hidden !important; }
 
+/* ── Ocultar botón nativo de colapso de sidebar ───────────────────────────
+   Se usa un enfoque nuclear (múltiples propiedades) porque display:none solo
+   puede ser sobreescrito por CSS de Streamlit con mayor especificidad.    */
+[data-testid="collapsedControl"],
+button[data-testid="collapsedControl"],
+[data-testid="stSidebar"] [data-testid="collapsedControl"] {
+  display:         none        !important;
+  visibility:      hidden      !important;
+  opacity:         0           !important;
+  pointer-events:  none        !important;
+  height:          0           !important;
+  width:           0           !important;
+  overflow:        hidden      !important;
+  position:        absolute    !important;
+  font-size:       0           !important;
+}
+
+/* ── Ocultar texto de íconos Material en triggers de popover ─────────────
+   st.popover() añade un ícono "expand_more" como span hijo. Si Material
+   Symbols no carga o la fuente es sobreescrita, muestra texto literal.
+   Ocultamos solo el span de texto del ícono, no el contenido del botón. */
+button[data-testid="stPopoverButton"] span:not(:first-child),
+button[data-testid="stPopoverButton"] span[class*="material"],
+[data-testid="stBaseButton-header"] span:not([aria-hidden]):empty,
+[data-testid="stBaseButton-header"] > span:last-child:not(:only-child) {
+  font-family: 'Material Symbols Sharp', 'Material Symbols Outlined', sans-serif !important;
+  font-optical-sizing: auto !important;
+}
+
 .block-container {
   max-width: 100% !important;
   padding: .75rem 1.25rem 3rem 1.25rem !important;
@@ -129,8 +158,20 @@ h1, h2, h3, h4, h5, h6,
 
 /* FIX CRÍTICO: excluir spans de Material Icons/Symbols para que no muestren
    el nombre del icono como texto (ej: "keyboard_double_arrow_left") */
-.stApp span:not([class*="material-symbols"]):not([class*="material-icons"]):not([class*="Material"]) {
-  font-family: 'Outfit', sans-serif !important;
+/* FIX: Eliminada la regla broad de .stApp span porque en ciertas versiones
+   de Streamlit las spans de Material Symbols NO llevan la clase en el atributo
+   class y el :not() no las protege. Se restaura la fuente Material Symbols
+   explícitamente para garantizar que los íconos rendericen correctamente. */
+
+/* Restaurar Material Symbols en cualquier span que tenga esa clase */
+span.material-symbols-sharp,
+span.material-symbols-outlined,
+span.material-symbols-rounded,
+[data-testid] span[class*="material"],
+[data-testid] span[class*="Material"] {
+  font-family: 'Material Symbols Sharp', 'Material Symbols Outlined', 'Material Symbols Rounded', sans-serif !important;
+  font-optical-sizing: auto !important;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24 !important;
 }
 
 [data-testid="stMetricValue"] {

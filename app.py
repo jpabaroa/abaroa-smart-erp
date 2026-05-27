@@ -85,6 +85,14 @@ def inject_sidebar_css(open_: bool = True):
                 overflow-y:auto !important;
             }
         }
+        /* Nuclear: ocultar botón nativo a toda resolución */
+        [data-testid="collapsedControl"],
+        button[data-testid="collapsedControl"] {
+            display:none !important; visibility:hidden !important;
+            opacity:0 !important; width:0 !important; height:0 !important;
+            overflow:hidden !important; pointer-events:none !important;
+            font-size:0 !important;
+        }
         """
     else:
         css = """
