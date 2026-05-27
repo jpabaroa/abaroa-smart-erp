@@ -564,30 +564,16 @@ def reset_transactional_data():
     """
     Borra todos los datos transaccionales dejando intactos:
     inventario, kits, vendedores, plantillas checklist, configuración.
-    Restaura stock_current = stock_initial y stock_reserved = 0 en inventario.
-    Retorna (ok: bool, mensaje: str, detalle: dict)
+    Restaura stock_current = stock_initial y stock_reserved = 0.
     """
     conn = get_conn()
     detalle = {}
     tablas_borrar = [
-        "project_checklist_items",
-        "project_checklists",
-        "project_items",
-        "work_order_items",
-        "work_orders",
-        "projects",
-        "quote_items",
-        "quotes",
-        "billing",
-        "sales",
-        "warranties",
-        "installations",
-        "inventory_movements",
-        "clients",
-        "suppliers",
-        "purchase_batch_items",
-        "purchase_batches",
-        "supplies_catalog",
+        "project_checklist_items","project_checklists","project_items",
+        "work_order_items","work_orders","projects",
+        "quote_items","quotes","billing","sales","warranties","installations",
+        "inventory_movements","clients","suppliers",
+        "purchase_batch_items","purchase_batches","supplies_catalog",
     ]
     for tabla in tablas_borrar:
         try:
@@ -595,11 +581,9 @@ def reset_transactional_data():
             detalle[tabla] = cur.rowcount
         except Exception as e:
             detalle[tabla] = f"ERROR: {e}"
-    # Restaurar stock: current = initial, reserved = 0
     conn.execute("UPDATE inventory SET stock_current = COALESCE(stock_initial, 0), stock_reserved = 0")
     detalle["inventory_reset"] = "stock_current = stock_initial, stock_reserved = 0"
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     return True, "Reset completado.", detalle
 
 def convert_quote_to_sale(quote_id):
