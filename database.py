@@ -247,6 +247,9 @@ CREATE TABLE IF NOT EXISTS sales (
     total           REAL    DEFAULT 0.0,
     amount_paid     REAL    DEFAULT 0.0,
     balance_due     REAL    DEFAULT 0.0,
+    material_cost   REAL    DEFAULT 0.0,
+    gross_margin    REAL    DEFAULT 0.0,
+    gross_margin_pct REAL   DEFAULT 0.0,
     notes           TEXT    DEFAULT '',
     created_at      TEXT    DEFAULT (datetime('now','localtime'))
 );
@@ -457,8 +460,22 @@ def init_db():
     """Crea todas las tablas si no existen. Idempotente."""
     conn = get_conn()
     conn.executescript(_SCHEMA)
+    # Migración segura: agrega columnas faltantes en tablas existentes
+    _safe_add_columns(conn, "sales", [
+        ("material_cost",    "REAL DEFAULT 0.0"),
+        ("gross_margin",     "REAL DEFAULT 0.0"),
+        ("gross_margin_pct", "REAL DEFAULT 0.0"),
+    ])
     conn.commit()
     conn.close()
+
+
+def _safe_add_columns(conn, table: str, columns: list[tuple]):
+    """Agrega columnas a una tabla si no existen (ALTER TABLE seguro)."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for col_name, col_def in columns:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
