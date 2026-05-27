@@ -535,8 +535,6 @@ def delete_project_and_reset_stock(project_id):
             reserved = int(it["reserved_quantity"] or 0)
             conn.execute("UPDATE inventory SET stock_reserved=MAX(0,COALESCE(stock_reserved,0)-?), stock_current=COALESCE(stock_current,0)+? WHERE sku=?",
                 (reserved, reserved, it["sku"]))
-            conn.execute("INSERT INTO inventory_movements(sku,movement_type,quantity,reference_type,reference_id,notes) VALUES(?,?,?,?,?,?)",
-                (it["sku"],"AJUSTE",reserved,"project_delete",project_id,f"Liberación por eliminación proyecto {proj['project_number']}"))
             detalle["stock_liberado"].append(f"{it['sku']} +{reserved}")
     cl = conn.execute("SELECT id FROM project_checklists WHERE project_id=?", (project_id,)).fetchall()
     for c_row in cl:
@@ -561,6 +559,48 @@ def delete_project_and_reset_stock(project_id):
             detalle["cotizacion"] = cot["quote_number"]
     conn.commit(); conn.close()
     return True, f"Proyecto {detalle['proyecto']} eliminado.", detalle
+
+def reset_transactional_data():
+    """
+    Borra todos los datos transaccionales dejando intactos:
+    inventario, kits, vendedores, plantillas checklist, configuración.
+    Restaura stock_current = stock_initial y stock_reserved = 0 en inventario.
+    Retorna (ok: bool, mensaje: str, detalle: dict)
+    """
+    conn = get_conn()
+    detalle = {}
+    tablas_borrar = [
+        "project_checklist_items",
+        "project_checklists",
+        "project_items",
+        "work_order_items",
+        "work_orders",
+        "projects",
+        "quote_items",
+        "quotes",
+        "billing",
+        "sales",
+        "warranties",
+        "installations",
+        "inventory_movements",
+        "clients",
+        "suppliers",
+        "purchase_batch_items",
+        "purchase_batches",
+        "supplies_catalog",
+    ]
+    for tabla in tablas_borrar:
+        try:
+            cur = conn.execute(f"DELETE FROM {tabla}")
+            detalle[tabla] = cur.rowcount
+        except Exception as e:
+            detalle[tabla] = f"ERROR: {e}"
+    # Restaurar stock: current = initial, reserved = 0
+    conn.execute("UPDATE inventory SET stock_current = COALESCE(stock_initial, 0), stock_reserved = 0")
+    detalle["inventory_reset"] = "stock_current = stock_initial, stock_reserved = 0"
+    conn.commit()
+    conn.close()
+    return True, "Reset completado.", detalle
 
 def convert_quote_to_sale(quote_id):
     conn = get_conn()
