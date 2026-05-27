@@ -1,1159 +1,1863 @@
 """
 database.py — Abaroa Smart ERP
-Conexión SQLite, schema, funciones CRUD y lógica de negocio.
+Capa de acceso a datos: SQLite con Row factory, inicialización de esquema,
+helpers de negocio y funciones de soporte para todas las vistas.
+
+Módulos cubiertos:
+  Inventario · Herramientas · Insumos · Kits · Proveedores
+  Clientes · Vendedores · Cotizaciones · Ventas · Facturación
+  Proyectos · OT (Órdenes de Trabajo) · Garantías
+  Respaldo / Restauración · Administración · Alertas
 """
 
 import sqlite3
-import shutil
 import hashlib
+import os
+from datetime import date, datetime
 from pathlib import Path
-from datetime import date, datetime, timedelta
 
-import pandas as pd
-
-# ── Rutas ─────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-IVA_RATE = 0.19
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuración
+# ─────────────────────────────────────────────────────────────────────────────
+DB_PATH = Path(__file__).resolve().parent / "erp_abaroa.db"
 
 
-def resolve_db_path():
-    preferred = BASE_DIR / "abaroa_smart_erp.db"
-    if preferred.exists():
-        return preferred
-    candidates = sorted(BASE_DIR.glob("abaroa_smart_erp*.db"), key=lambda p: p.name)
-    return candidates[0] if candidates else preferred
-
-
-DB_PATH = resolve_db_path()
-BACKUP_DIR = BASE_DIR / "backups"
-EXPORT_DIR = BASE_DIR / "exports"
-UPLOAD_DIR = BASE_DIR / "uploads" / "inventory"
-APP_DIR = BASE_DIR
-
-BACKUP_DIR.mkdir(exist_ok=True)
-EXPORT_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ── Conexión ───────────────────────────────────────────────────────────────────
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_conn() -> sqlite3.Connection:
+    """Devuelve una conexión con Row factory habilitado."""
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
-def q(conn, sql, params=(), fetch=False):
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    if fetch:
-        return cur.fetchall()
+# ─────────────────────────────────────────────────────────────────────────────
+# init_db — esquema completo
+# ─────────────────────────────────────────────────────────────────────────────
+_SCHEMA = """
+-- ══════════════════════════════════════════
+--  CONFIGURACIÓN DEL SISTEMA
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS app_settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL DEFAULT ''
+);
+
+-- ══════════════════════════════════════════
+--  PROVEEDORES
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS suppliers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    contact     TEXT    DEFAULT '',
+    phone       TEXT    DEFAULT '',
+    email       TEXT    DEFAULT '',
+    address     TEXT    DEFAULT '',
+    notes       TEXT    DEFAULT '',
+    created_at  TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  CLIENTES
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS clients (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    rut         TEXT    DEFAULT '',
+    phone       TEXT    DEFAULT '',
+    email       TEXT    DEFAULT '',
+    address     TEXT    DEFAULT '',
+    commune     TEXT    DEFAULT '',
+    region      TEXT    DEFAULT '',
+    notes       TEXT    DEFAULT '',
+    created_at  TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  VENDEDORES
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS vendors (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    phone       TEXT    DEFAULT '',
+    email       TEXT    DEFAULT '',
+    commission  REAL    DEFAULT 0.0,
+    active      INTEGER DEFAULT 1,
+    created_at  TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  INVENTARIO (Productos)
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS products (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku             TEXT    UNIQUE NOT NULL,
+    name            TEXT    NOT NULL,
+    description     TEXT    DEFAULT '',
+    category        TEXT    DEFAULT '',
+    brand           TEXT    DEFAULT '',
+    model           TEXT    DEFAULT '',
+    unit            TEXT    DEFAULT 'un',
+    cost_price      REAL    DEFAULT 0.0,
+    margin          REAL    DEFAULT 30.0,   -- porcentaje
+    sale_price      REAL    DEFAULT 0.0,    -- calculado
+    stock           REAL    DEFAULT 0.0,
+    stock_min       REAL    DEFAULT 0.0,
+    stock_max       REAL    DEFAULT 0.0,
+    location        TEXT    DEFAULT '',
+    supplier_id     INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    vat_exempt      INTEGER DEFAULT 0,      -- 1 = exento IVA
+    active          INTEGER DEFAULT 1,
+    image_url       TEXT    DEFAULT '',
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime')),
+    updated_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  MOVIMIENTOS DE STOCK
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS stock_movements (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id      INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    movement_type   TEXT    NOT NULL,   -- 'entrada','salida','ajuste','uso_ot','uso_proyecto'
+    quantity        REAL    NOT NULL,
+    reference_type  TEXT    DEFAULT '', -- 'compra','venta','ot','proyecto','ajuste_manual'
+    reference_id    INTEGER DEFAULT NULL,
+    cost_unit       REAL    DEFAULT 0.0,
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  HERRAMIENTAS
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS tools (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL,
+    serial          TEXT    DEFAULT '',
+    brand           TEXT    DEFAULT '',
+    model           TEXT    DEFAULT '',
+    category        TEXT    DEFAULT '',
+    condition       TEXT    DEFAULT 'bueno',  -- bueno, regular, malo, baja
+    location        TEXT    DEFAULT '',
+    purchase_date   TEXT    DEFAULT '',
+    purchase_price  REAL    DEFAULT 0.0,
+    assigned_to     TEXT    DEFAULT '',
+    notes           TEXT    DEFAULT '',
+    active          INTEGER DEFAULT 1,
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  INSUMOS (materiales menores / consumibles)
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS supplies (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL,
+    sku             TEXT    DEFAULT '',
+    category        TEXT    DEFAULT '',
+    unit            TEXT    DEFAULT 'un',
+    cost_price      REAL    DEFAULT 0.0,
+    sale_price      REAL    DEFAULT 0.0,
+    stock           REAL    DEFAULT 0.0,
+    stock_min       REAL    DEFAULT 0.0,
+    supplier_id     INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    notes           TEXT    DEFAULT '',
+    active          INTEGER DEFAULT 1,
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  KITS (bundles de productos)
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS kits (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL,
+    description     TEXT    DEFAULT '',
+    category        TEXT    DEFAULT '',
+    sale_price      REAL    DEFAULT 0.0,  -- precio fijo manual (0 = calculado)
+    margin          REAL    DEFAULT 30.0,
+    active          INTEGER DEFAULT 1,
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS kit_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kit_id      INTEGER NOT NULL REFERENCES kits(id) ON DELETE CASCADE,
+    product_id  INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    supply_id   INTEGER REFERENCES supplies(id) ON DELETE SET NULL,
+    description TEXT    DEFAULT '',
+    quantity    REAL    NOT NULL DEFAULT 1,
+    unit_price  REAL    DEFAULT 0.0,
+    line_total  REAL    DEFAULT 0.0
+);
+
+-- ══════════════════════════════════════════
+--  COTIZACIONES
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS quotes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    quote_number    TEXT    UNIQUE NOT NULL,
+    client_id       INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+    vendor_id       INTEGER REFERENCES vendors(id) ON DELETE SET NULL,
+    quote_date      TEXT    DEFAULT (date('now','localtime')),
+    valid_until     TEXT    DEFAULT '',
+    status          TEXT    DEFAULT 'borrador',  -- borrador, enviada, aprobada, rechazada, vencida
+    subtotal        REAL    DEFAULT 0.0,
+    vat_amount      REAL    DEFAULT 0.0,
+    total           REAL    DEFAULT 0.0,
+    notes           TEXT    DEFAULT '',
+    terms           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime')),
+    updated_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS quote_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    quote_id        INTEGER NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+    item_type       TEXT    NOT NULL DEFAULT 'producto',  -- producto, kit, servicio, insumo
+    product_id      INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    kit_id          INTEGER REFERENCES kits(id) ON DELETE SET NULL,
+    supply_id       INTEGER REFERENCES supplies(id) ON DELETE SET NULL,
+    description     TEXT    NOT NULL DEFAULT '',
+    quantity        REAL    DEFAULT 1,
+    unit_price      REAL    DEFAULT 0.0,
+    discount        REAL    DEFAULT 0.0,  -- porcentaje
+    line_total      REAL    DEFAULT 0.0,
+    vat_exempt      INTEGER DEFAULT 0,
+    sort_order      INTEGER DEFAULT 0
+);
+
+-- ══════════════════════════════════════════
+--  VENTAS
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS sales (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_number     TEXT    UNIQUE NOT NULL,
+    quote_id        INTEGER REFERENCES quotes(id) ON DELETE SET NULL,
+    client_id       INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+    vendor_id       INTEGER REFERENCES vendors(id) ON DELETE SET NULL,
+    sale_date       TEXT    DEFAULT (date('now','localtime')),
+    payment_method  TEXT    DEFAULT 'efectivo',  -- efectivo, transferencia, cheque, tarjeta, mixto
+    payment_status  TEXT    DEFAULT 'pendiente', -- pendiente, parcial, pagado
+    subtotal        REAL    DEFAULT 0.0,
+    vat_amount      REAL    DEFAULT 0.0,
+    total           REAL    DEFAULT 0.0,
+    amount_paid     REAL    DEFAULT 0.0,
+    balance_due     REAL    DEFAULT 0.0,
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS sale_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id     INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+    item_type   TEXT    DEFAULT 'producto',
+    description TEXT    NOT NULL,
+    quantity    REAL    DEFAULT 1,
+    unit_price  REAL    DEFAULT 0.0,
+    line_total  REAL    DEFAULT 0.0,
+    vat_exempt  INTEGER DEFAULT 0
+);
+
+-- ══════════════════════════════════════════
+--  FACTURACIÓN
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS invoices (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_number  TEXT    UNIQUE NOT NULL,
+    sale_id         INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+    client_id       INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+    invoice_date    TEXT    DEFAULT (date('now','localtime')),
+    due_date        TEXT    DEFAULT '',
+    type            TEXT    DEFAULT 'boleta',  -- boleta, factura, nota_credito
+    status          TEXT    DEFAULT 'emitida', -- emitida, anulada, pagada
+    subtotal        REAL    DEFAULT 0.0,
+    vat_amount      REAL    DEFAULT 0.0,
+    total           REAL    DEFAULT 0.0,
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  PROYECTOS
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS projects (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_number      TEXT    UNIQUE NOT NULL,
+    name                TEXT    NOT NULL,
+    client_id           INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+    vendor_id           INTEGER REFERENCES vendors(id) ON DELETE SET NULL,
+    quotation_id        INTEGER REFERENCES quotes(id) ON DELETE SET NULL,
+    status              TEXT    DEFAULT 'planificado',
+    -- planificado, en_progreso, pausado, completado, cancelado
+    priority            TEXT    DEFAULT 'normal',  -- baja, normal, alta, urgente
+    start_date          TEXT    DEFAULT '',
+    installation_date   TEXT    DEFAULT '',
+    delivery_date       TEXT    DEFAULT '',
+    end_date            TEXT    DEFAULT '',
+    address             TEXT    DEFAULT '',
+    description         TEXT    DEFAULT '',
+    technician          TEXT    DEFAULT '',
+    progress_pct        INTEGER DEFAULT 0,
+    notes               TEXT    DEFAULT '',
+    created_at          TEXT    DEFAULT (datetime('now','localtime')),
+    updated_at          TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS project_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    item_type       TEXT    DEFAULT 'producto',  -- producto, kit_component, insumo, servicio
+    product_id      INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    supply_id       INTEGER REFERENCES supplies(id) ON DELETE SET NULL,
+    sku             TEXT    DEFAULT '',
+    description     TEXT    NOT NULL DEFAULT '',
+    quantity        REAL    DEFAULT 1,
+    used_quantity   REAL    DEFAULT 0,
+    unit_price      REAL    DEFAULT 0.0,
+    line_total      REAL    DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS project_checklists (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title       TEXT    NOT NULL DEFAULT 'Checklist',
+    created_at  TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS project_checklist_items (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_checklist_id    INTEGER NOT NULL REFERENCES project_checklists(id) ON DELETE CASCADE,
+    item_text               TEXT    NOT NULL,
+    is_checked              INTEGER DEFAULT 0,
+    evidence_note           TEXT    DEFAULT '',
+    sort_order              INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS project_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    log_type    TEXT    DEFAULT 'nota',  -- nota, estado, foto, documento
+    content     TEXT    NOT NULL,
+    author      TEXT    DEFAULT '',
+    created_at  TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  ÓRDENES DE TRABAJO (OT)
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS work_orders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ot_number       TEXT    UNIQUE NOT NULL,
+    client_id       INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+    project_id      INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    vendor_id       INTEGER REFERENCES vendors(id) ON DELETE SET NULL,
+    type            TEXT    DEFAULT 'instalación',
+    -- instalación, mantención, garantía, diagnóstico, retiro
+    status          TEXT    DEFAULT 'abierta',
+    -- abierta, en_progreso, pausada, cerrada, cancelada
+    priority        TEXT    DEFAULT 'normal',
+    scheduled_date  TEXT    DEFAULT '',
+    start_date      TEXT    DEFAULT '',
+    end_date        TEXT    DEFAULT '',
+    description     TEXT    DEFAULT '',
+    technician      TEXT    DEFAULT '',
+    address         TEXT    DEFAULT '',
+    diagnosis       TEXT    DEFAULT '',
+    solution        TEXT    DEFAULT '',
+    travel_km       REAL    DEFAULT 0,
+    labor_hours     REAL    DEFAULT 0,
+    labor_rate      REAL    DEFAULT 0,
+    parts_cost      REAL    DEFAULT 0,
+    total_cost      REAL    DEFAULT 0,
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime')),
+    updated_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS ot_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ot_id       INTEGER NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+    item_type   TEXT    DEFAULT 'producto',
+    product_id  INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    supply_id   INTEGER REFERENCES supplies(id) ON DELETE SET NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    quantity    REAL    DEFAULT 1,
+    unit_price  REAL    DEFAULT 0.0,
+    line_total  REAL    DEFAULT 0.0
+);
+
+-- ══════════════════════════════════════════
+--  GARANTÍAS
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS warranties (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    warranty_number TEXT    UNIQUE NOT NULL,
+    client_id       INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+    project_id      INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    ot_id           INTEGER REFERENCES work_orders(id) ON DELETE SET NULL,
+    product_name    TEXT    DEFAULT '',
+    serial_number   TEXT    DEFAULT '',
+    issue_date      TEXT    DEFAULT (date('now','localtime')),
+    expiry_date     TEXT    DEFAULT '',
+    status          TEXT    DEFAULT 'vigente',  -- vigente, vencida, usada, anulada
+    description     TEXT    DEFAULT '',
+    resolution      TEXT    DEFAULT '',
+    technician      TEXT    DEFAULT '',
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+-- ══════════════════════════════════════════
+--  COMPRAS / RECEPCIONES
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS purchases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    purchase_number TEXT    UNIQUE NOT NULL,
+    supplier_id     INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    purchase_date   TEXT    DEFAULT (date('now','localtime')),
+    invoice_ref     TEXT    DEFAULT '',
+    status          TEXT    DEFAULT 'recibida',  -- pendiente, recibida, parcial
+    total           REAL    DEFAULT 0.0,
+    notes           TEXT    DEFAULT '',
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS purchase_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    purchase_id INTEGER NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
+    product_id  INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    supply_id   INTEGER REFERENCES supplies(id) ON DELETE SET NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    quantity    REAL    DEFAULT 1,
+    unit_cost   REAL    DEFAULT 0.0,
+    line_total  REAL    DEFAULT 0.0,
+    received    REAL    DEFAULT 0.0
+);
+
+-- ══════════════════════════════════════════
+--  RESPALDO / AUDITORÍA
+-- ══════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    action      TEXT    NOT NULL,
+    table_name  TEXT    DEFAULT '',
+    record_id   INTEGER DEFAULT NULL,
+    user        TEXT    DEFAULT 'system',
+    detail      TEXT    DEFAULT '',
+    created_at  TEXT    DEFAULT (datetime('now','localtime'))
+);
+"""
+
+
+def init_db():
+    """Crea todas las tablas si no existen. Idempotente."""
+    conn = get_conn()
+    conn.executescript(_SCHEMA)
     conn.commit()
-    return cur
-
-
-def get_df(sql, params=()):
-    conn = get_conn()
-    df = pd.read_sql_query(sql, conn, params=params)
     conn.close()
-    return df
 
 
-# ── Helpers de columnas ────────────────────────────────────────────────────────
-def ensure_column(conn, table, column, definition):
-    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        conn.commit()
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuración / Settings
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEFAULT_SETTINGS = {
+    "company_name":     "Abaroa Smart",
+    "company_rut":      "",
+    "company_phone":    "+56 9 8183 8679",
+    "company_email":    "contacto@abaroasmart.com",
+    "company_address":  "Osorno, Región de Los Lagos",
+    "company_web":      "www.abaroasmart.com",
+    "admin_username":   "admin",
+    "admin_password":   _hash_password("admin123"),
+    "vat_rate":         "19",
+    "default_margin":   "30",
+    "quote_prefix":     "COT",
+    "sale_prefix":      "VTA",
+    "ot_prefix":        "OT",
+    "project_prefix":   "PRY",
+    "warranty_months":  "6",
+    "currency":         "CLP",
+    "low_stock_alert":  "1",
+}
 
 
-def table_columns(table_name):
-    conn = get_conn()
-    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
-    conn.close()
-    return cols
-
-
-def table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
-
-
-# ── Auth / Settings ───────────────────────────────────────────────────────────
-def hash_password(raw):
-    return hashlib.sha256(str(raw or "").encode("utf-8")).hexdigest()
+def _hash_password(plain: str) -> str:
+    return hashlib.sha256(plain.encode()).hexdigest()
 
 
 def ensure_app_settings():
+    """Inserta valores por defecto solo si la clave no existe."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
-    defaults = {
-        "admin_username": "admin",
-        "admin_password_hash": hash_password("admin123"),
-    }
-    for k, v in defaults.items():
-        cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)", (k, v))
+    defaults = dict(_DEFAULT_SETTINGS)
+    # La clave admin_password puede no estar en _DEFAULT_SETTINGS con hash real
+    # porque la función _hash_password no es accesible en la definición del dict.
+    # Recalculamos:
+    defaults["admin_password"] = _hash_password("admin123")
+    for key, value in defaults.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
     conn.commit()
     conn.close()
 
 
-def get_setting(key, default=""):
+def get_setting(key: str, default: str = "") -> str:
+    """Lee un valor de app_settings."""
     conn = get_conn()
-    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key=?", (key,)
+    ).fetchone()
     conn.close()
     return row["value"] if row else default
 
 
-def set_setting(key, value):
+def set_setting(key: str, value: str):
+    """Guarda o actualiza un valor en app_settings."""
     conn = get_conn()
-    conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", (key, value))
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+        (key, str(value)),
+    )
     conn.commit()
     conn.close()
 
 
-def verify_admin_credentials(username, password):
+def get_all_settings() -> dict:
+    """Devuelve todos los settings como dict."""
+    conn = get_conn()
+    rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    conn.close()
+    return {r["key"]: r["value"] for r in rows}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autenticación admin
+# ─────────────────────────────────────────────────────────────────────────────
+
+def verify_admin_credentials(username: str, password: str) -> bool:
+    """Verifica usuario y contraseña del administrador."""
     stored_user = get_setting("admin_username", "admin")
-    stored_hash = get_setting("admin_password_hash", hash_password("admin123"))
-    return (str(username or "").strip() == stored_user and
-            hash_password(password) == stored_hash)
+    stored_hash = get_setting("admin_password", _hash_password("admin123"))
+    return (username.strip() == stored_user.strip() and
+            _hash_password(password) == stored_hash)
 
 
-def admin_logged_in():
-    import streamlit as st
-    return st.session_state.get("admin_logged_in", False)
-
-
-# ── SKU helpers ───────────────────────────────────────────────────────────────
-def category_prefix(category):
-    base = (category or "").strip().lower()
-    mapping = {
-        "interruptores": "INT", "cámara": "CAM", "camaras": "CAM", "cámaras": "CAM",
-        "clima": "CLI", "ir": "IR", "sensores": "SEN", "motores": "MOT",
-        "configuraciones": "CFG", "integraciones": "IGR", "mantenciones": "MNT",
-        "consultorías": "CON", "consultorias": "CON", "diseño": "DIS", "diseno": "DIS",
-        "auditorías": "AUD", "auditorias": "AUD", "insumos": "INS",
-    }
-    if base in mapping:
-        return mapping[base]
-    letters = "".join(ch for ch in base.upper() if ch.isalpha())
-    return (letters[:3] if letters else "GEN").ljust(3, "X")
-
-
-def sku_prefix_for_item(category, is_service=False):
-    base = "SRV" if is_service else "PRD"
-    return f"{base}-{category_prefix(category)}"
-
-
-def next_sku_for_category(category, existing_skus, is_service=False):
-    prefix = sku_prefix_for_item(category, is_service)
-    nums = []
-    for sku in existing_skus:
-        if isinstance(sku, str) and sku.startswith(prefix + "-"):
-            try:
-                nums.append(int(sku.split("-")[-1]))
-            except Exception:
-                pass
-    nxt = (max(nums) + 1) if nums else 1
-    return f"{prefix}-{nxt:04d}"
-
-
-def build_category_sku_map(rows):
-    counters = {}
-    sku_map = {}
-    for row in rows:
-        prefix = sku_prefix_for_item(row["category"], bool(row["is_service"]))
-        counters[prefix] = counters.get(prefix, 0) + 1
-        sku_map[row["sku"]] = f"{prefix}-{counters[prefix]:04d}"
-    return sku_map
-
-
-# ── Imágenes inventario ───────────────────────────────────────────────────────
-def inventory_image_web_path(path_value):
-    path_str = str(path_value or "").strip()
-    if not path_str:
-        return ""
-    normalized = path_str.replace("\\", "/")
-    if normalized.startswith("http://") or normalized.startswith("https://"):
-        return normalized
-    candidate = Path(normalized)
-    if not candidate.is_absolute():
-        candidate = BASE_DIR / normalized.lstrip("/\\")
+def admin_logged_in() -> bool:
+    """Comprueba el estado de sesión admin en Streamlit session_state."""
     try:
-        candidate = candidate.resolve()
+        import streamlit as st
+        return bool(st.session_state.get("admin_logged_in", False))
     except Exception:
-        pass
-    return str(candidate) if candidate.exists() else ""
+        return False
 
 
-def save_inventory_image(uploaded_file, sku):
-    if uploaded_file is None or not sku:
-        return ""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = Path(uploaded_file.name).suffix.lower() or ".jpg"
-    if suffix == ".jpeg":
-        suffix = ".jpg"
-    safe_sku = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(sku))
-    target = UPLOAD_DIR / f"{safe_sku}{suffix}"
-    temp_target = UPLOAD_DIR / f"{safe_sku}.__tmp__{suffix}"
-    data = uploaded_file.getbuffer()
-    with open(temp_target, "wb") as f:
-        f.write(data)
-    for old_path in UPLOAD_DIR.glob(f"{safe_sku}.*"):
-        if old_path.name == temp_target.name:
-            continue
-        try:
-            old_path.unlink()
-        except Exception:
-            pass
-    try:
-        temp_target.replace(target)
-    except Exception:
-        if temp_target.exists():
-            try:
-                temp_target.unlink()
-            except Exception:
-                pass
-        raise
-    return str(target.relative_to(BASE_DIR)).replace("\\", "/")
+def change_admin_password(new_password: str):
+    set_setting("admin_password", _hash_password(new_password))
 
 
-# ── Recálculos ────────────────────────────────────────────────────────────────
-def calc_sale_price(cost_unit, margin_pct):
-    return int(round(float(cost_unit) * (1 + float(margin_pct) / 100), 0))
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Recálculo de precios de venta
+# ─────────────────────────────────────────────────────────────────────────────
 
 def recalc_all_sale_prices():
+    """
+    Recalcula sale_price de products donde sale_price == 0 o está desactualizado
+    usando cost_price * (1 + margin/100).
+    Solo actualiza si el precio calculado difiere del almacenado.
+    """
     conn = get_conn()
-    rows = conn.execute("SELECT sku, cost_unit, margin_pct FROM inventory").fetchall()
+    rows = conn.execute(
+        "SELECT id, cost_price, margin, sale_price FROM products WHERE active=1"
+    ).fetchall()
     for row in rows:
-        sp = calc_sale_price(row["cost_unit"] or 0, row["margin_pct"] or 0)
-        conn.execute("UPDATE inventory SET sale_price = ? WHERE sku = ?", (int(sp), row["sku"]))
+        if row["cost_price"] and row["margin"]:
+            calc = round(row["cost_price"] * (1 + row["margin"] / 100), 0)
+            if abs(calc - (row["sale_price"] or 0)) > 0.5:
+                conn.execute(
+                    "UPDATE products SET sale_price=?, updated_at=datetime('now','localtime') WHERE id=?",
+                    (calc, row["id"]),
+                )
     conn.commit()
     conn.close()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recálculo de stock desde movimientos
+# ─────────────────────────────────────────────────────────────────────────────
 
 def recalc_stock():
+    """
+    Recalcula el stock de productos a partir de stock_movements.
+    Usa SUM(cantidad) con signo: entradas positivas, salidas negativas.
+    Solo recalcula si hay movimientos registrados para ese producto;
+    si no hay movimientos, mantiene el valor manual.
+    """
     conn = get_conn()
-    cur = conn.cursor()
-    items = cur.execute("SELECT sku, stock_initial, is_service FROM inventory").fetchall()
-    for row in items:
-        sku = row["sku"]
-        if row["is_service"]:
-            cur.execute("UPDATE inventory SET stock_current=0, stock_reserved=0 WHERE sku=?", (sku,))
-            continue
-        used = cur.execute(
-            "SELECT COALESCE(SUM(used_quantity),0) FROM project_items WHERE sku=? AND item_type IN ('producto','kit_component')", (sku,)
-        ).fetchone()[0]
-        reserved = cur.execute(
-            "SELECT COALESCE(SUM(reserved_quantity),0) FROM project_items WHERE sku=? AND item_type IN ('producto','kit_component')", (sku,)
-        ).fetchone()[0]
-        stock_initial = int(row["stock_initial"] or 0)
-        stock_current = max(stock_initial - int(used or 0), 0)
-        stock_reserved = min(max(int(reserved or 0), 0), stock_current)
-        cur.execute("UPDATE inventory SET stock_current=?, stock_reserved=? WHERE sku=?", (stock_current, stock_reserved, sku))
+    movements = conn.execute("""
+        SELECT product_id,
+               SUM(CASE WHEN movement_type IN ('entrada') THEN quantity
+                        WHEN movement_type IN ('salida','uso_ot','uso_proyecto') THEN -quantity
+                        ELSE quantity END) AS net_stock
+        FROM stock_movements
+        GROUP BY product_id
+    """).fetchall()
+    for row in movements:
+        conn.execute(
+            "UPDATE products SET stock=? WHERE id=?",
+            (max(0, row["net_stock"] or 0), row["product_id"]),
+        )
     conn.commit()
     conn.close()
 
 
-def landed_cost_per_unit(unit_price, customs, shipping, other, qty):
-    qty = max(int(qty or 1), 1)
-    total = int(unit_price or 0) * qty + int(customs or 0) + int(shipping or 0) + int(other or 0)
-    return int(round(total / qty, 0))
-
-
-# ── Normalización textos ──────────────────────────────────────────────────────
-def normalize_text(value):
-    return " ".join(str(value or "").strip().lower().split())
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Eliminar filas duplicadas
+# ─────────────────────────────────────────────────────────────────────────────
 
 def remove_duplicate_rows():
+    """
+    Elimina duplicados en tablas críticas manteniendo el registro con menor id.
+    Ejecuta solo las tablas que pueden tener colisiones por UNIQUE constraints.
+    """
     conn = get_conn()
-    cur = conn.cursor()
-    rows = cur.execute("SELECT id, name, phone, email, address FROM clients ORDER BY id").fetchall()
-    seen = {}
-    to_delete = []
-    for r in rows:
-        key = (normalize_text(r["name"]), normalize_text(r["phone"]), normalize_text(r["email"]), normalize_text(r["address"]))
-        if key in seen:
-            to_delete.append(r["id"])
-        else:
-            seen[key] = r["id"]
-    for rid in to_delete:
-        cur.execute("DELETE FROM clients WHERE id=?", (rid,))
+    # Productos duplicados por SKU
+    conn.execute("""
+        DELETE FROM products
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM products GROUP BY sku
+        )
+    """)
+    # Cotizaciones duplicadas por quote_number
+    conn.execute("""
+        DELETE FROM quotes
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM quotes GROUP BY quote_number
+        )
+    """)
+    # Ventas duplicadas por sale_number
+    conn.execute("""
+        DELETE FROM sales
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM sales GROUP BY sale_number
+        )
+    """)
+    # OT duplicadas por ot_number
+    conn.execute("""
+        DELETE FROM work_orders
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM work_orders GROUP BY ot_number
+        )
+    """)
+    # Proyectos duplicados por project_number
+    conn.execute("""
+        DELETE FROM projects
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM projects GROUP BY project_number
+        )
+    """)
     conn.commit()
     conn.close()
 
 
-# ── Alertas ───────────────────────────────────────────────────────────────────
-def get_alerts_data():
+# ─────────────────────────────────────────────────────────────────────────────
+# Alertas del sistema
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_alerts_data() -> list[dict]:
+    """
+    Devuelve lista de alertas activas del sistema.
+    Cada alerta es un dict con keys: level, title, detail.
+    Niveles: 'warning' (naranja) | 'info' (azul)
+    """
     alerts = []
-    try:
-        low_stock_df = get_df("""
-            SELECT sku, description, stock_current, stock_min FROM inventory
-            WHERE COALESCE(is_service,0)=0 AND COALESCE(stock_min,0)>0
-              AND COALESCE(stock_current,0) <= COALESCE(stock_min,0)
-            ORDER BY stock_current ASC LIMIT 8
-        """)
-        for _, row in low_stock_df.iterrows():
-            alerts.append({"level": "warning", "title": f"Stock bajo · {row['sku']}",
-                           "detail": f"{row['description']} · stock {int(row['stock_current'] or 0)} / mín {int(row['stock_min'] or 0)}"})
-    except Exception:
-        pass
-    try:
-        pq = get_df("SELECT quote_number, status FROM quotes WHERE COALESCE(status,'Pendiente') IN ('Pendiente','Enviada') ORDER BY id DESC LIMIT 5")
-        for _, row in pq.iterrows():
-            alerts.append({"level": "info", "title": f"Cotización {row['quote_number']}", "detail": f"Estado: {row['status']}"})
-    except Exception:
-        pass
-    try:
-        pp = get_df("SELECT project_number, status, technical_status FROM projects WHERE COALESCE(status,'Pendiente') NOT IN ('Entregado','Cerrado') ORDER BY id DESC LIMIT 5")
-        for _, row in pp.iterrows():
-            alerts.append({"level": "info", "title": f"Proyecto {row['project_number']}",
-                           "detail": f"Estado: {row['status']} · Técnico: {row['technical_status']}"})
-    except Exception:
-        pass
-    return alerts[:10]
-
-
-# ── Respaldo ──────────────────────────────────────────────────────────────────
-def backup_database(custom_name=""):
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"{custom_name}_{ts}.db" if custom_name else f"abaroa_smart_erp_backup_{ts}.db"
-    backup_path = BACKUP_DIR / name
-    if DB_PATH.exists():
-        shutil.copy2(DB_PATH, backup_path)
-        return backup_path
-    return None
-
-
-def list_backups():
-    return sorted(BACKUP_DIR.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def restore_backup(backup_name):
-    backup_path = BACKUP_DIR / backup_name
-    if not backup_path.exists():
-        return False, "Respaldo no encontrado."
-    if DB_PATH.exists():
-        pre = BACKUP_DIR / f"pre_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        shutil.copy2(DB_PATH, pre)
-    shutil.copy2(backup_path, DB_PATH)
-    try:
-        init_db()
-        remove_duplicate_rows()
-        recalc_all_sale_prices()
-        recalc_stock()
-    except Exception:
-        pass
-    return True, f"Base restaurada desde {backup_name}."
-
-
-def restore_from_uploaded_db(uploaded_file_bytes):
-    tmp = APP_DIR / "_restore_temp.db"
-    with open(tmp, "wb") as f:
-        f.write(uploaded_file_bytes)
-    try:
-        conn = sqlite3.connect(str(tmp))
-        conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
-        conn.close()
-    except Exception:
-        if tmp.exists():
-            tmp.unlink()
-        return False, "El archivo no parece ser una SQLite válida."
-    if DB_PATH.exists():
-        safe = BACKUP_DIR / f"pre_upload_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        shutil.copy2(DB_PATH, safe)
-    shutil.copy2(tmp, DB_PATH)
-    tmp.unlink(missing_ok=True)
-    try:
-        init_db()
-        remove_duplicate_rows()
-        recalc_all_sale_prices()
-        recalc_stock()
-    except Exception:
-        pass
-    return True, "Base restaurada desde archivo cargado."
-
-
-def export_all_data_json():
-    import json
     conn = get_conn()
-    tables = ["inventory", "clients", "vendors", "quotes", "quote_items", "sales", "billing",
-              "warranties", "installations", "kits", "kit_items", "work_orders", "work_order_items",
-              "inventory_movements", "projects", "project_items", "project_checklists",
-              "project_checklist_items", "purchase_batches", "purchase_batch_items",
-              "tools_assets", "suppliers", "supplies_catalog"]
-    data = {}
-    for t in tables:
-        try:
-            rows = conn.execute(f"SELECT * FROM {t}").fetchall()
-            data[t] = [dict(r) for r in rows]
-        except Exception:
-            data[t] = []
+
+    # 1. Stock bajo (products)
+    low_stock = conn.execute("""
+        SELECT name, sku, stock, stock_min
+        FROM products
+        WHERE active=1 AND stock_min > 0 AND stock <= stock_min
+        ORDER BY (stock_min - stock) DESC
+        LIMIT 10
+    """).fetchall()
+    for p in low_stock:
+        alerts.append({
+            "level": "warning",
+            "title": f"Stock bajo: {p['name']}",
+            "detail": f"SKU {p['sku']} · Stock actual: {p['stock']} · Mínimo: {p['stock_min']}",
+        })
+
+    # 2. Stock bajo (insumos)
+    low_supplies = conn.execute("""
+        SELECT name, stock, stock_min
+        FROM supplies
+        WHERE active=1 AND stock_min > 0 AND stock <= stock_min
+        LIMIT 5
+    """).fetchall()
+    for s in low_supplies:
+        alerts.append({
+            "level": "warning",
+            "title": f"Insumo bajo: {s['name']}",
+            "detail": f"Stock actual: {s['stock']} · Mínimo: {s['stock_min']}",
+        })
+
+    # 3. Cotizaciones vencidas (enviadas con valid_until < hoy)
+    today = date.today().isoformat()
+    expired_quotes = conn.execute("""
+        SELECT q.quote_number, c.name AS client_name, q.valid_until
+        FROM quotes q LEFT JOIN clients c ON c.id=q.client_id
+        WHERE q.status='enviada' AND q.valid_until != '' AND q.valid_until < ?
+        ORDER BY q.valid_until ASC
+        LIMIT 5
+    """, (today,)).fetchall()
+    for q in expired_quotes:
+        alerts.append({
+            "level": "warning",
+            "title": f"Cotización vencida: {q['quote_number']}",
+            "detail": f"Cliente: {q['client_name'] or '-'} · Venció: {q['valid_until']}",
+        })
+
+    # 4. OT vencidas (abiertas con scheduled_date < hoy)
+    overdue_ot = conn.execute("""
+        SELECT ot_number, scheduled_date
+        FROM work_orders
+        WHERE status IN ('abierta','en_progreso')
+          AND scheduled_date != '' AND scheduled_date < ?
+        ORDER BY scheduled_date ASC
+        LIMIT 5
+    """, (today,)).fetchall()
+    for ot in overdue_ot:
+        alerts.append({
+            "level": "info",
+            "title": f"OT vencida: {ot['ot_number']}",
+            "detail": f"Programada para: {ot['scheduled_date']}",
+        })
+
+    # 5. Garantías por vencer (próximos 30 días)
+    warranty_soon = conn.execute("""
+        SELECT warranty_number, product_name, expiry_date
+        FROM warranties
+        WHERE status='vigente' AND expiry_date != ''
+          AND expiry_date BETWEEN ? AND date(?, '+30 days')
+        ORDER BY expiry_date ASC
+        LIMIT 5
+    """, (today, today)).fetchall()
+    for w in warranty_soon:
+        alerts.append({
+            "level": "info",
+            "title": f"Garantía por vencer: {w['warranty_number']}",
+            "detail": f"{w['product_name']} · Vence: {w['expiry_date']}",
+        })
+
     conn.close()
-    out = APP_DIR / f"export_abaroa_smart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out
+    return alerts
 
 
-# ── Cotizaciones ──────────────────────────────────────────────────────────────
-def save_quote(quote_number, quote_date, client_id, vendor_id, validity_days, status, notes,
-               product_lines, service_lines, kit_lines, supply_lines):
-    subtotal_products = int(sum(l["line_total"] for l in product_lines))
-    subtotal_services = int(sum(l["line_total"] for l in service_lines))
-    subtotal_kits = int(sum(l["line_total"] for l in kit_lines))
-    subtotal_supplies = int(sum(l["line_total"] for l in supply_lines))
-    vat_products = int(round((subtotal_products + subtotal_kits + subtotal_supplies) * IVA_RATE, 0))
-    total = int(subtotal_products + subtotal_kits + subtotal_services + subtotal_supplies + vat_products)
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers de correlativo / numeración automática
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _next_number(prefix_key: str, table: str, col: str) -> str:
+    """Genera el próximo número correlativo del tipo PREFIX-NNNN."""
+    prefix = get_setting(prefix_key, prefix_key.upper()[:3])
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO quotes (quote_number, quote_date, client_id, vendor_id, validity_days, status, notes,
-            subtotal_products, subtotal_services_exempt, vat_products, total)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (quote_number, quote_date, client_id, vendor_id, int(validity_days), status, notes,
-          subtotal_products + subtotal_kits + subtotal_supplies, subtotal_services, vat_products, total))
-    quote_id = cur.lastrowid
-    for line in product_lines:
-        cur.execute("INSERT INTO quote_items (quote_id, item_type, sku, description, quantity, unit_price, line_total, vat_exempt) VALUES (?, 'producto', ?, ?, ?, ?, ?, 0)",
-                    (quote_id, line["sku"], line["description"], int(line["quantity"]), int(line["unit_price"]), int(line["line_total"])))
-    for line in service_lines:
-        cur.execute("INSERT INTO quote_items (quote_id, item_type, sku, description, quantity, unit_price, line_total, vat_exempt) VALUES (?, 'servicio', ?, ?, ?, ?, ?, 1)",
-                    (quote_id, line["sku"], line["description"], int(line["quantity"]), int(line["unit_price"]), int(line["line_total"])))
-    for line in supply_lines:
-        cur.execute("INSERT INTO quote_items (quote_id, item_type, sku, description, quantity, unit_price, line_total, vat_exempt) VALUES (?, 'insumo', ?, ?, ?, ?, ?, 0)",
-                    (quote_id, line["sku"], line["description"], int(line["quantity"]), int(line["unit_price"]), int(line["line_total"])))
-    for line in kit_lines:
-        cur.execute("INSERT INTO quote_items (quote_id, item_type, sku, description, quantity, unit_price, line_total, vat_exempt) VALUES (?, 'kit', ?, ?, ?, ?, ?, 0)",
-                    (quote_id, line["code"], line["name"], int(line["quantity"]), int(line["unit_price"]), int(line["line_total"])))
-    conn.commit()
-    conn.close()
-    recalc_stock()
-    return quote_id, total
-
-
-def load_quote_context(quote_id):
-    header_df = get_df("""
-        SELECT q.id, q.quote_number, q.quote_date, q.status, q.notes, q.total,
-               q.subtotal_products, q.subtotal_services_exempt, q.vat_products,
-               c.id as client_id, c.name as client_name, c.phone, c.email, c.address,
-               v.name as vendor_name
-        FROM quotes q
-        LEFT JOIN clients c ON c.id = q.client_id
-        LEFT JOIN vendors v ON v.id = q.vendor_id
-        WHERE q.id = ?
-    """, (quote_id,))
-    if header_df.empty:
-        return None
-    h = header_df.iloc[0].to_dict()
-    items_df = get_df("SELECT item_type, sku, description, quantity, unit_price, line_total FROM quote_items WHERE quote_id=? ORDER BY id", (quote_id,))
-    product_lines, service_lines, kit_lines, supply_lines = [], [], [], []
-    for _, r in items_df.iterrows():
-        item = {"sku": r["sku"], "description": r["description"], "quantity": int(r["quantity"]),
-                "unit_price": int(r["unit_price"]), "line_total": int(r["line_total"])}
-        if r["item_type"] == "producto":
-            product_lines.append(item)
-        elif r["item_type"] == "servicio":
-            service_lines.append(item)
-        elif r["item_type"] == "kit":
-            item["name"] = r["description"]
-            item["code"] = r["sku"]
-            kit_lines.append(item)
-        elif r["item_type"] == "insumo":
-            supply_lines.append(item)
-    return {"header": h,
-            "client_row": {"name": h.get("client_name",""), "phone": h.get("phone",""), "email": h.get("email",""), "address": h.get("address",""), "id": h.get("client_id")},
-            "vendor_name": h.get("vendor_name",""),
-            "product_lines": product_lines, "service_lines": service_lines,
-            "kit_lines": kit_lines, "supply_lines": supply_lines}
-
-
-def duplicate_quote(quote_id):
-    ctx = load_quote_context(quote_id)
-    if not ctx:
-        return False, "Cotización no encontrada."
-    h = ctx["header"]
-    new_number = f"COP-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    new_id, total_saved = save_quote(new_number, date.today().isoformat(), int(h["client_id"]),
-                                     None, 10, "Borrador", h.get("notes",""),
-                                     ctx["product_lines"], ctx["service_lines"],
-                                     ctx["kit_lines"], ctx["supply_lines"])
-    return True, f"Cotización duplicada: {new_number} (ID {new_id})"
-
-
-def delete_quote(quote_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM quote_items WHERE quote_id=?", (quote_id,))
-    cur.execute("DELETE FROM quotes WHERE id=?", (quote_id,))
-    conn.commit()
-    conn.close()
-    recalc_stock()
-
-
-def validate_quote_before_save(client_row, product_lines, service_lines, kit_lines, supply_lines, products_df):
-    errors = []
-    if not (client_row and bool(str(client_row.get("name","") or "").strip())):
-        errors.append("Debes seleccionar un cliente.")
-    if not product_lines and not service_lines and not kit_lines and not supply_lines:
-        errors.append("Agrega al menos un producto, kit, servicio o insumo.")
-    for line in product_lines:
-        sku = line.get("sku")
-        if products_df.loc[products_df["sku"] == sku].empty:
-            errors.append(f"No se encontró el producto {line.get('description','')}.")
-    return errors
-
-
-def get_quote_stock_warnings(product_lines, products_df):
-    warnings = []
-    for line in product_lines or []:
-        sku = line.get("sku")
-        qty = int(line.get("quantity", 0) or 0)
-        prod = products_df.loc[products_df["sku"] == sku]
-        if prod.empty:
-            continue
-        stock = int(prod.iloc[0]["stock_current"] or 0)
-        reserved = int(prod.iloc[0]["stock_reserved"] or 0) if "stock_reserved" in prod.columns else 0
-        available = max(stock - reserved, 0)
-        if qty > available:
-            warnings.append(f"Stock insuficiente para {line.get('description','')}: disponible {available}, solicitado {qty}.")
-    return warnings
-
-
-# ── Ventas ────────────────────────────────────────────────────────────────────
-def convert_quote_to_sale(quote_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    quote = cur.execute("SELECT * FROM quotes WHERE id=?", (quote_id,)).fetchone()
-    if not quote:
-        conn.close()
-        return False, "Cotización no encontrada."
-    product_cost = cur.execute("""
-        SELECT COALESCE(SUM(qi.quantity * inv.cost_unit),0)
-        FROM quote_items qi LEFT JOIN inventory inv ON inv.sku=qi.sku
-        WHERE qi.quote_id=? AND qi.item_type='producto'
-    """, (quote_id,)).fetchone()[0]
-    kit_cost = cur.execute("""
-        SELECT COALESCE(SUM(qi.quantity * ki.quantity * inv.cost_unit),0)
-        FROM quote_items qi JOIN kits k ON k.code=qi.sku
-        JOIN kit_items ki ON ki.kit_id=k.id JOIN inventory inv ON inv.sku=ki.sku
-        WHERE qi.quote_id=? AND qi.item_type='kit'
-    """, (quote_id,)).fetchone()[0]
-    supplies_cost = cur.execute(
-        "SELECT COALESCE(SUM(qi.line_total),0) FROM quote_items qi WHERE qi.quote_id=? AND qi.item_type='insumo'", (quote_id,)
-    ).fetchone()[0]
-    material_cost = int(product_cost or 0) + int(kit_cost or 0) + int(supplies_cost or 0)
-    total = int(quote["total"] or 0)
-    gross_margin = int(round(total - material_cost, 0))
-    gross_margin_pct = round((gross_margin / total), 4) if total else 0
-    existing_sale = cur.execute("SELECT id FROM sales WHERE quote_id=? ORDER BY id DESC LIMIT 1", (quote_id,)).fetchone()
-    if existing_sale:
-        sale_id = int(existing_sale["id"])
-        cur.execute("UPDATE sales SET sale_date=?, client_id=?, total=?, material_cost=?, gross_margin=?, gross_margin_pct=? WHERE id=?",
-                    (date.today().isoformat(), quote["client_id"], total, material_cost, gross_margin, gross_margin_pct, sale_id))
-    else:
-        cur.execute("INSERT INTO sales (sale_date, client_id, quote_id, total, material_cost, gross_margin, gross_margin_pct) VALUES (?,?,?,?,?,?,?)",
-                    (date.today().isoformat(), quote["client_id"], quote_id, total, material_cost, gross_margin, gross_margin_pct))
-        sale_id = cur.lastrowid
-    advance = int(round(total * 0.5, 0))
-    balance = int(total - advance)
-    existing_billing = cur.execute("SELECT id FROM billing WHERE sale_id=? ORDER BY id DESC LIMIT 1", (sale_id,)).fetchone()
-    if existing_billing:
-        cur.execute("UPDATE billing SET client_id=?, total=?, advance_50=?, balance_50=?, payment_status=? WHERE id=?",
-                    (quote["client_id"], total, advance, balance, "Anticipo 50%", int(existing_billing["id"])))
-    else:
-        cur.execute("INSERT INTO billing (sale_id, client_id, total, advance_50, balance_50, payment_status) VALUES (?,?,?,?,?,'Anticipo 50%')",
-                    (sale_id, quote["client_id"], total, advance, balance))
-    cur.execute("UPDATE quotes SET status='Vendida' WHERE id=?", (quote_id,))
-    conn.commit()
-    conn.close()
-    create_warranty_for_sale(sale_id, quote["client_id"])
-    recalc_stock()
-    return True, f"Venta #{sale_id} creada desde cotización #{quote_id}."
-
-
-def create_warranty_for_sale(sale_id, client_id, install_date=None, warranty_months=6, notes="Garantía automática"):
-    install_date = install_date or date.today().isoformat()
-    expiry_date = (datetime.fromisoformat(install_date).date() + timedelta(days=30 * int(warranty_months))).isoformat()
-    conn = get_conn()
-    cur = conn.cursor()
-    exists = cur.execute("SELECT id FROM warranties WHERE sale_id=?", (sale_id,)).fetchone()
-    if not exists:
-        cur.execute("INSERT INTO warranties (client_id, sale_id, install_date, warranty_months, expiry_date, status, notes) VALUES (?,?,?,?,?,?,?)",
-                    (client_id, sale_id, install_date, int(warranty_months), expiry_date, "Vigente", notes))
-        conn.commit()
-    conn.close()
-
-
-# ── Kits ───────────────────────────────────────────────────────────────────────
-def kit_components_df(kit_id):
-    return get_df("""
-        SELECT ki.sku, inv.description, ki.quantity, inv.stock_current, inv.sale_price, inv.cost_unit
-        FROM kit_items ki LEFT JOIN inventory inv ON inv.sku=ki.sku
-        WHERE ki.kit_id=? ORDER BY ki.id
-    """, (kit_id,))
-
-
-# ── Proyectos ─────────────────────────────────────────────────────────────────
-def project_exists_for_quote(quote_id):
-    conn = get_conn()
-    row = conn.execute("SELECT id FROM projects WHERE quotation_id=? LIMIT 1", (quote_id,)).fetchone()
-    conn.close()
-    return int(row["id"]) if row else None
-
-
-def create_project_checklist(project_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    template = cur.execute("SELECT id FROM checklist_templates WHERE is_active=1 ORDER BY id LIMIT 1").fetchone()
-    if not template:
-        conn.close()
-        return None
-    template_id = int(template["id"])
-    cur.execute("INSERT INTO project_checklists (project_id, template_id, status) VALUES (?,?,'Pendiente')", (project_id, template_id))
-    checklist_id = cur.lastrowid
-    items = cur.execute("SELECT item_text, is_required FROM checklist_template_items WHERE template_id=? ORDER BY item_order", (template_id,)).fetchall()
-    for item in items:
-        cur.execute("INSERT INTO project_checklist_items (project_checklist_id, item_text, is_required) VALUES (?,?,?)",
-                    (checklist_id, item["item_text"], int(item["is_required"] or 0)))
-    conn.commit()
-    conn.close()
-    return checklist_id
-
-
-def reserve_inventory_for_project(project_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    items = cur.execute("SELECT * FROM project_items WHERE project_id=?", (project_id,)).fetchall()
-    for item in items:
-        if item["item_type"] not in ("producto", "kit_component"):
-            continue
-        sku = item["sku"]
-        qty = int(item["quantity"] or 0)
-        inv = cur.execute("SELECT stock_current, stock_reserved FROM inventory WHERE sku=?", (sku,)).fetchone()
-        if not inv:
-            continue
-        available = max(int(inv["stock_current"] or 0) - int(inv["stock_reserved"] or 0), 0)
-        reserve_qty = min(qty, available)
-        if reserve_qty <= 0:
-            continue
-        cur.execute("UPDATE inventory SET stock_reserved=COALESCE(stock_reserved,0)+? WHERE sku=?", (reserve_qty, sku))
-        cur.execute("UPDATE project_items SET reserved_quantity=COALESCE(reserved_quantity,0)+? WHERE id=?", (reserve_qty, item["id"]))
-        cur.execute("INSERT INTO inventory_movements (sku, movement_type, quantity, reference_type, reference_id, notes) VALUES (?,'RESERVE',?,'project',?,?)",
-                    (sku, reserve_qty, project_id, f"Reserva por proyecto #{project_id}"))
-    conn.commit()
-    conn.close()
-
-
-def release_reserved_stock_for_project(project_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    items = cur.execute("SELECT id, sku, reserved_quantity FROM project_items WHERE project_id=?", (project_id,)).fetchall()
-    for item in items:
-        qty = int(item["reserved_quantity"] or 0)
-        if not item["sku"] or qty <= 0:
-            continue
-        cur.execute("UPDATE inventory SET stock_reserved=MAX(COALESCE(stock_reserved,0)-?,0) WHERE sku=?", (qty, item["sku"]))
-        cur.execute("UPDATE project_items SET reserved_quantity=0 WHERE id=?", (item["id"],))
-        cur.execute("INSERT INTO inventory_movements (sku, movement_type, quantity, reference_type, reference_id, notes) VALUES (?,'RELEASE_RESERVE',?,'project',?,?)",
-                    (item["sku"], qty, project_id, f"Liberación reserva proyecto #{project_id}"))
-    conn.commit()
-    conn.close()
-
-
-def consume_inventory_for_project(project_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    items = cur.execute("SELECT id, sku, quantity, reserved_quantity, used_quantity FROM project_items WHERE project_id=?", (project_id,)).fetchall()
-    for item in items:
-        sku = item["sku"]
-        if not sku:
-            continue
-        target_qty = int(item["quantity"] or 0)
-        already_used = int(item["used_quantity"] or 0)
-        consume_qty = max(target_qty - already_used, 0)
-        if consume_qty <= 0:
-            continue
-        inv = cur.execute("SELECT stock_current, stock_reserved FROM inventory WHERE sku=?", (sku,)).fetchone()
-        if not inv:
-            continue
-        consume_qty = min(consume_qty, int(inv["stock_current"] or 0))
-        release_qty = min(consume_qty, int(inv["stock_reserved"] or 0))
-        cur.execute("UPDATE inventory SET stock_current=MAX(COALESCE(stock_current,0)-?,0), stock_reserved=MAX(COALESCE(stock_reserved,0)-?,0) WHERE sku=?",
-                    (consume_qty, release_qty, sku))
-        cur.execute("UPDATE project_items SET used_quantity=COALESCE(used_quantity,0)+?, reserved_quantity=MAX(COALESCE(reserved_quantity,0)-?,0) WHERE id=?",
-                    (consume_qty, release_qty, item["id"]))
-        cur.execute("INSERT INTO inventory_movements (sku, movement_type, quantity, reference_type, reference_id, notes) VALUES (?,'PROJECT_CONSUMPTION',?,'project',?,?)",
-                    (sku, consume_qty, project_id, f"Consumo real proyecto #{project_id}"))
-    conn.commit()
-    conn.close()
-
-
-def sync_project_item_usage(item_id, new_used_quantity):
-    conn = get_conn()
-    cur = conn.cursor()
-    item = cur.execute("SELECT id, project_id, sku, quantity, reserved_quantity, used_quantity, item_type FROM project_items WHERE id=?", (item_id,)).fetchone()
-    if not item:
-        conn.close()
-        return False, "Ítem no encontrado."
-    if item["item_type"] not in ("producto", "kit_component", "insumo"):
-        cur.execute("UPDATE project_items SET used_quantity=? WHERE id=?", (max(new_used_quantity, 0), item_id))
-        conn.commit()
-        conn.close()
-        return True, "Uso actualizado."
-    target_qty = max(0, min(int(new_used_quantity or 0), int(item["quantity"] or 0)))
-    current_used = int(item["used_quantity"] or 0)
-    delta = target_qty - current_used
-    if delta == 0:
-        conn.close()
-        return True, "Sin cambios."
-    sku = item["sku"]
-    inv = cur.execute("SELECT stock_current, stock_reserved FROM inventory WHERE sku=?", (sku,)).fetchone() if sku else None
-    if not inv:
-        cur.execute("UPDATE project_items SET used_quantity=? WHERE id=?", (target_qty, item_id))
-        conn.commit()
-        conn.close()
-        return True, "Uso actualizado sin impacto de inventario."
-    stock_current = int(inv["stock_current"] or 0)
-    stock_reserved = int(inv["stock_reserved"] or 0)
-    if delta > 0:
-        consume_qty = min(delta, stock_current)
-        release_qty = min(consume_qty, stock_reserved, max(int(item["reserved_quantity"] or 0), 0))
-        cur.execute("UPDATE inventory SET stock_current=MAX(COALESCE(stock_current,0)-?,0), stock_reserved=MAX(COALESCE(stock_reserved,0)-?,0) WHERE sku=?",
-                    (consume_qty, release_qty, sku))
-        cur.execute("UPDATE project_items SET used_quantity=COALESCE(used_quantity,0)+?, reserved_quantity=MAX(COALESCE(reserved_quantity,0)-?,0) WHERE id=?",
-                    (consume_qty, release_qty, item_id))
-        cur.execute("INSERT INTO inventory_movements (sku, movement_type, quantity, reference_type, reference_id, notes) VALUES (?,'PROJECT_CONSUMPTION',?,'project',?,?)",
-                    (sku, consume_qty, item["project_id"], f"Consumo manual proyecto #{item['project_id']}"))
-    else:
-        restore_qty = abs(delta)
-        cur.execute("UPDATE inventory SET stock_current=COALESCE(stock_current,0)+?, stock_reserved=COALESCE(stock_reserved,0)+? WHERE sku=?",
-                    (restore_qty, restore_qty, sku))
-        cur.execute("UPDATE project_items SET used_quantity=MAX(COALESCE(used_quantity,0)-?,0), reserved_quantity=COALESCE(reserved_quantity,0)+? WHERE id=?",
-                    (restore_qty, restore_qty, item_id))
-        cur.execute("INSERT INTO inventory_movements (sku, movement_type, quantity, reference_type, reference_id, notes) VALUES (?,'USAGE_ADJUSTMENT',?,'project',?,?)",
-                    (sku, restore_qty, item["project_id"], f"Ajuste manual proyecto #{item['project_id']}"))
-    conn.commit()
-    conn.close()
-    return True, "Uso actualizado correctamente."
-
-
-def validate_project_completion(project_id):
-    conn = get_conn()
-    checklist = conn.execute("SELECT id FROM project_checklists WHERE project_id=? ORDER BY id DESC LIMIT 1", (project_id,)).fetchone()
-    if not checklist:
-        conn.close()
-        return False, "Proyecto sin checklist."
-    pending = conn.execute(
-        "SELECT COUNT(*) AS c FROM project_checklist_items WHERE project_checklist_id=? AND is_required=1 AND COALESCE(is_checked,0)=0",
-        (int(checklist["id"]),)
+    row = conn.execute(
+        f"SELECT {col} FROM {table} ORDER BY id DESC LIMIT 1"
     ).fetchone()
     conn.close()
-    return (False, "Checklist incompleto.") if int(pending["c"] or 0) > 0 else (True, "Checklist completo.")
+    if row and row[0]:
+        # Extraer la parte numérica del último registro
+        parts = str(row[0]).split("-")
+        try:
+            num = int(parts[-1]) + 1
+        except ValueError:
+            num = 1
+    else:
+        num = 1
+    return f"{prefix}-{num:04d}"
 
 
-def create_project_from_quote(quote_id, installation_date=None, configuration_url="", notes=""):
-    existing = project_exists_for_quote(quote_id)
-    if existing:
-        return False, existing, "La cotización ya tiene un proyecto asociado."
+def next_quote_number() -> str:
+    return _next_number("quote_prefix", "quotes", "quote_number")
+
+
+def next_sale_number() -> str:
+    return _next_number("sale_prefix", "sales", "sale_number")
+
+
+def next_ot_number() -> str:
+    return _next_number("ot_prefix", "work_orders", "ot_number")
+
+
+def next_project_number() -> str:
+    return _next_number("project_prefix", "projects", "project_number")
+
+
+def next_purchase_number() -> str:
+    return _next_number("purchase_prefix", "purchases", "purchase_number")
+
+
+def next_warranty_number() -> str:
+    return _next_number("warranty_prefix", "warranties", "warranty_number")
+
+
+def next_invoice_number() -> str:
+    return _next_number("invoice_prefix", "invoices", "invoice_number")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Clientes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_clients(search: str = "") -> list:
     conn = get_conn()
-    cur = conn.cursor()
-    quote = cur.execute("SELECT * FROM quotes WHERE id=?", (quote_id,)).fetchone()
-    if not quote:
-        conn.close()
-        return False, None, "No se encontró la cotización."
-    client = cur.execute("SELECT * FROM clients WHERE id=?", (quote["client_id"],)).fetchone()
-    quote_items = cur.execute("SELECT * FROM quote_items WHERE quote_id=? ORDER BY id", (quote_id,)).fetchall()
-    project_number = f"PROY-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    project_name = f"{client['name'] if client else 'Cliente'} · {quote['quote_number']}"
-    cur.execute("""
-        INSERT INTO projects (project_number, quotation_id, client_id, name, description, status, technical_status,
-            installation_date, configuration_url, notes, checklist_required, updated_at)
-        VALUES (?,?,?,?,?,'Aprobado','Pendiente',?,?,?,1,CURRENT_TIMESTAMP)
-    """, (project_number, quote_id, quote["client_id"], project_name,
-          f"Proyecto desde cotización {quote['quote_number']}", installation_date, configuration_url, notes))
-    project_id = cur.lastrowid
-    for item in quote_items:
-        item_type = item["item_type"]
-        if item_type == "kit":
-            comps = cur.execute("""
-                SELECT ki.sku, ki.quantity, i.description, i.cost_unit FROM kit_items ki
-                LEFT JOIN inventory i ON i.sku=ki.sku
-                WHERE ki.kit_id=(SELECT id FROM kits WHERE code=? LIMIT 1)
-            """, (item["sku"],)).fetchall()
-            for comp in comps:
-                qty = int(item["quantity"] or 0) * int(comp["quantity"] or 0)
-                cur.execute("INSERT INTO project_items (project_id, item_type, sku, description, quantity, unit_cost, unit_price, total_price) VALUES (?,'kit_component',?,?,?,?,0,0)",
-                            (project_id, comp["sku"], comp["description"] or comp["sku"], qty, int(comp["cost_unit"] or 0)))
-        else:
-            inv = cur.execute("SELECT cost_unit FROM inventory WHERE sku=?", (item["sku"],)).fetchone()
-            unit_cost = int(inv["cost_unit"] or 0) if inv else 0
-            cur.execute("INSERT INTO project_items (project_id, item_type, sku, description, quantity, unit_cost, unit_price, total_price) VALUES (?,?,?,?,?,?,?,?)",
-                        (project_id, item_type, item["sku"], item["description"], int(item["quantity"] or 0), unit_cost, int(item["unit_price"] or 0), int(item["line_total"] or 0)))
-    cur.execute("UPDATE quotes SET status='Aprobada' WHERE id=?", (quote_id,))
-    conn.commit()
+    q = "%" + search + "%"
+    rows = conn.execute(
+        "SELECT * FROM clients WHERE name LIKE ? OR rut LIKE ? OR phone LIKE ? OR email LIKE ? ORDER BY name",
+        (q, q, q, q),
+    ).fetchall()
     conn.close()
-    create_project_checklist(project_id)
-    reserve_inventory_for_project(project_id)
-    return True, project_id, f"Proyecto #{project_id} creado desde la cotización."
+    return rows
 
 
-# ── OT ────────────────────────────────────────────────────────────────────────
-def create_work_order_from_project(project_id, scheduled_date=None):
+def get_client(client_id: int):
     conn = get_conn()
-    cur = conn.cursor()
-    project = cur.execute("""
-        SELECT p.*, c.address AS client_address FROM projects p
-        LEFT JOIN clients c ON c.id=p.client_id WHERE p.id=?
-    """, (project_id,)).fetchone()
-    if not project:
-        conn.close()
-        return False, None, "Proyecto no encontrado."
-    existing = cur.execute("SELECT id, ot_number FROM work_orders WHERE quote_id=? AND client_id=? ORDER BY id DESC LIMIT 1",
-                           (project["quotation_id"], project["client_id"])).fetchone()
-    if existing:
-        conn.close()
-        return True, int(existing["id"]), f"OT existente {existing['ot_number']}."
-    ot_number = f"OT-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    cur.execute("""
-        INSERT INTO work_orders (ot_number, client_id, vendor_id, quote_id, status, scheduled_date, address,
-            hours_work, labor_cost, travel_cost, extra_material_cost, notes)
-        VALUES (?,?,?,?,'Pendiente',?,?,0,0,0,0,?)
-    """, (ot_number, project["client_id"], None, project["quotation_id"],
-          scheduled_date or project["installation_date"] or date.today().isoformat(),
-          project["client_address"] or "", f"OT generada desde proyecto {project['project_number']}"))
-    ot_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return True, ot_id, f"OT {ot_number} creada correctamente."
-
-
-def add_wo_item(work_order_id, sku, description, quantity, cost_unit):
-    conn = get_conn()
-    line_cost = int(quantity) * int(cost_unit)
-    q(conn, "INSERT INTO work_order_items (work_order_id, sku, description, quantity, cost_unit, line_cost) VALUES (?,?,?,?,?,?)",
-      (work_order_id, sku, description, int(quantity), int(cost_unit), int(line_cost)))
-    conn.close()
-
-
-def get_workflow_ot(project_id):
-    conn = get_conn()
-    row = conn.execute("""
-        SELECT wo.* FROM work_orders wo
-        JOIN projects p ON p.quotation_id=wo.quote_id AND p.client_id=wo.client_id
-        WHERE p.id=? ORDER BY wo.id DESC LIMIT 1
-    """, (project_id,)).fetchone()
+    row = conn.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
     conn.close()
     return row
 
 
-def close_project_workflow(project_id):
-    ok, msg = validate_project_completion(project_id)
-    if not ok:
-        return False, msg
+def upsert_client(data: dict) -> int:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE projects SET status='Entregado', technical_status='Cerrado', delivery_date=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (date.today().isoformat(), project_id))
-    cur.execute("""
-        UPDATE work_orders SET status='Cerrada'
-        WHERE quote_id=(SELECT quotation_id FROM projects WHERE id=?)
-          AND client_id=(SELECT client_id FROM projects WHERE id=?)
-          AND COALESCE(status,'Pendiente') IN ('Pendiente','Agendada','En ejecución','Abierta','En proceso')
-    """, (project_id, project_id))
-    conn.commit()
-    conn.close()
-    recalc_stock()
-    return True, "Proyecto, acta y OT cerrados correctamente."
-
-
-# ── Herramientas ──────────────────────────────────────────────────────────────
-def calc_monthly_tool_cost(cost_unit, quantity, useful_life_months):
-    qty = max(int(quantity or 0), 1)
-    life = max(int(useful_life_months or 0), 1)
-    return int(round(int(cost_unit or 0) * qty / life, 0))
-
-
-def normalize_tools_df(df):
-    df = df.copy()
-    rename_map = {"producto": "tool_name", "proveedor": "provider", "cantidad": "quantity",
-                  "costo_unitario": "cost_unit", "categoria": "category", "nombre": "tool_name"}
-    for src, dst in rename_map.items():
-        if src in df.columns and dst not in df.columns:
-            df[dst] = df[src]
-    if "asset_id" not in df.columns:
-        df["asset_id"] = [f"TL-{i+1:04d}" for i in range(len(df.index))]
-    defaults = {"tool_name": "", "category": "Herramienta", "provider": "", "quantity": 1,
-                "cost_unit": 0, "purchase_date": "", "useful_life_months": 12, "monthly_cost": 0, "status": "Activa", "notes": ""}
-    for col, default in defaults.items():
-        if col not in df.columns:
-            df[col] = default
-    for col in ["quantity", "cost_unit", "useful_life_months", "monthly_cost"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    df["quantity"] = df["quantity"].clip(lower=1)
-    df["useful_life_months"] = df["useful_life_months"].clip(lower=1)
-    if (df["monthly_cost"] == 0).any():
-        mask = df["monthly_cost"] == 0
-        df.loc[mask, "monthly_cost"] = ((df.loc[mask, "cost_unit"] * df.loc[mask, "quantity"]) / df.loc[mask, "useful_life_months"]).round().astype(int)
-    ordered = ["asset_id","tool_name","category","provider","quantity","cost_unit","purchase_date","useful_life_months","monthly_cost","status","notes"]
-    return df[[c for c in ordered if c in df.columns]]
-
-
-def import_tools_csv(uploaded_file):
-    df = normalize_tools_df(pd.read_csv(uploaded_file))
-    conn = get_conn()
-    cur = conn.cursor()
-    inserted = 0
-    for _, row in df.iterrows():
-        asset_id = str(row.get("asset_id", "") or "").strip()
-        tool_name = str(row.get("tool_name", "") or "").strip()
-        if not asset_id or not tool_name:
-            continue
-        monthly_cost = calc_monthly_tool_cost(row.get("cost_unit", 0), row.get("quantity", 1), row.get("useful_life_months", 12))
-        cur.execute("""
-            INSERT INTO tools_assets (asset_id, tool_name, category, provider, quantity, cost_unit,
-                purchase_date, useful_life_months, monthly_cost, status, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(asset_id) DO UPDATE SET tool_name=excluded.tool_name, category=excluded.category,
-                provider=excluded.provider, quantity=excluded.quantity, cost_unit=excluded.cost_unit,
-                purchase_date=excluded.purchase_date, useful_life_months=excluded.useful_life_months,
-                monthly_cost=excluded.monthly_cost, status=excluded.status, notes=excluded.notes
-        """, (asset_id, tool_name, str(row.get("category","Herramienta") or "Herramienta").strip(),
-              str(row.get("provider","") or "").strip(), int(row.get("quantity",1) or 1),
-              int(row.get("cost_unit",0) or 0), str(row.get("purchase_date","") or "").strip(),
-              int(row.get("useful_life_months",12) or 12), monthly_cost,
-              str(row.get("status","Activa") or "Activa").strip(), str(row.get("notes","") or "").strip()))
-        inserted += 1
-    conn.commit()
-    conn.close()
-    return inserted
-
-
-# ── Búsqueda global ───────────────────────────────────────────────────────────
-def search_like_clause(columns):
-    return " OR ".join([f"COALESCE(CAST({col} AS TEXT),'') LIKE ?" for col in columns])
-
-
-def run_global_search(term):
-    needle = f"%{str(term or '').strip()}%"
-    results = {}
-    conn = get_conn()
-    specs = {
-        "Inventario": (f"SELECT sku AS codigo, description AS titulo, category AS detalle_1, provider AS detalle_2, sale_price AS monto FROM inventory WHERE {search_like_clause(['sku','description','category','provider','protocol','location'])} ORDER BY category, sku LIMIT 200", [needle]*6),
-        "Clientes": (f"SELECT CAST(id AS TEXT) AS codigo, name AS titulo, phone AS detalle_1, email AS detalle_2, NULL AS monto FROM clients WHERE {search_like_clause(['id','name','phone','email','address'])} ORDER BY id DESC LIMIT 200", [needle]*5),
-        "Cotizaciones": (f"SELECT quote_number AS codigo, COALESCE(c.name,'Sin cliente') AS titulo, q.status AS detalle_1, q.quote_date AS detalle_2, q.total AS monto FROM quotes q LEFT JOIN clients c ON c.id=q.client_id WHERE {search_like_clause(['q.quote_number','q.status','q.quote_date','q.notes','c.name'])} ORDER BY q.id DESC LIMIT 200", [needle]*5),
-        "OT": (f"SELECT ot_number AS codigo, COALESCE(c.name,'Sin cliente') AS titulo, w.status AS detalle_1, w.scheduled_date AS detalle_2, (COALESCE(w.labor_cost,0)+COALESCE(w.travel_cost,0)+COALESCE(w.extra_material_cost,0)) AS monto FROM work_orders w LEFT JOIN clients c ON c.id=w.client_id WHERE {search_like_clause(['w.ot_number','w.status','w.scheduled_date','w.address','w.notes','c.name'])} ORDER BY w.id DESC LIMIT 200", [needle]*6),
-        "Proyectos": (f"SELECT project_number AS codigo, COALESCE(name,'Sin nombre') AS titulo, status AS detalle_1, technical_status AS detalle_2, NULL AS monto FROM projects WHERE {search_like_clause(['project_number','name','description','status','technical_status','configuration_url','notes'])} ORDER BY id DESC LIMIT 200", [needle]*7),
-        "Ventas": (f"SELECT CAST(s.id AS TEXT) AS codigo, COALESCE(c.name,'Sin cliente') AS titulo, s.sale_date AS detalle_1, printf('Margen %.1f%%', COALESCE(s.gross_margin_pct,0)*100.0) AS detalle_2, s.total AS monto FROM sales s LEFT JOIN clients c ON c.id=s.client_id WHERE {search_like_clause(['s.id','s.sale_date','c.name'])} ORDER BY s.id DESC LIMIT 200", [needle]*3),
-        "Kits": (f"SELECT code AS codigo, name AS titulo, notes AS detalle_1, NULL AS detalle_2, sale_price AS monto FROM kits WHERE {search_like_clause(['code','name','notes'])} ORDER BY code LIMIT 200", [needle]*3),
-        "Proveedores": (f"SELECT CAST(id AS TEXT) AS codigo, name AS titulo, phone AS detalle_1, email AS detalle_2, NULL AS monto FROM suppliers WHERE {search_like_clause(['id','name','phone','email','contact_person','notes'])} ORDER BY id DESC LIMIT 200", [needle]*6),
-    }
-    try:
-        for name, (sql, params) in specs.items():
-            try:
-                results[name] = pd.read_sql_query(sql, conn, params=params)
-            except Exception:
-                results[name] = pd.DataFrame(columns=["codigo","titulo","detalle_1","detalle_2","monto"])
-    finally:
-        conn.close()
-    return results
-
-
-# ── Dashboard helpers ─────────────────────────────────────────────────────────
-def get_dashboard_work_orders_df(limit=8):
-    cols = set(table_columns("work_orders"))
-    if "estimated_material_cost" in cols:
-        sql = "SELECT ot_number AS OT, status AS Estado, scheduled_date AS Fecha, estimated_material_cost AS 'Costo estimado' FROM work_orders WHERE COALESCE(status,'Pendiente') IN ('Pendiente','Agendada','En ejecución','Abierta','En proceso') ORDER BY id DESC LIMIT ?"
+    if data.get("id"):
+        conn.execute("""
+            UPDATE clients SET name=?,rut=?,phone=?,email=?,address=?,commune=?,region=?,notes=?
+            WHERE id=?
+        """, (data["name"], data.get("rut",""), data.get("phone",""), data.get("email",""),
+              data.get("address",""), data.get("commune",""), data.get("region",""),
+              data.get("notes",""), data["id"]))
+        rid = data["id"]
     else:
-        cost_parts = [f"COALESCE({c},0)" for c in ["labor_cost","travel_cost","extra_material_cost"] if c in cols]
-        cost_expr = "+".join(cost_parts) if cost_parts else "0"
-        sql = f"SELECT ot_number AS OT, status AS Estado, scheduled_date AS Fecha, ({cost_expr}) AS 'Costo estimado' FROM work_orders WHERE COALESCE(status,'Pendiente') IN ('Pendiente','Agendada','En ejecución','Abierta','En proceso') ORDER BY id DESC LIMIT ?"
-    return get_df(sql, (limit,))
-
-
-# ── Init DB ───────────────────────────────────────────────────────────────────
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS inventory (
-        sku TEXT PRIMARY KEY, description TEXT NOT NULL, category TEXT, protocol TEXT,
-        stock_initial INTEGER, stock_current INTEGER, cost_unit INTEGER, margin_pct INTEGER,
-        sale_price INTEGER, provider TEXT, is_service INTEGER DEFAULT 0, stock_min INTEGER DEFAULT 0,
-        image_path TEXT DEFAULT '', location TEXT DEFAULT '',
-        stock_reserved INTEGER DEFAULT 0, average_landed_cost INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS clients (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        phone TEXT, email TEXT, address TEXT, rut TEXT, notes TEXT
-    );
-    CREATE TABLE IF NOT EXISTS vendors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        email TEXT, phone TEXT, role TEXT
-    );
-    CREATE TABLE IF NOT EXISTS supplies_catalog (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        description TEXT UNIQUE NOT NULL, default_unit_price INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS suppliers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL,
-        phone TEXT, email TEXT, contact_person TEXT, notes TEXT
-    );
-    CREATE TABLE IF NOT EXISTS quotes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, quote_number TEXT NOT NULL,
-        quote_date TEXT NOT NULL, client_id INTEGER, vendor_id INTEGER,
-        validity_days INTEGER DEFAULT 10, status TEXT DEFAULT 'Borrador', notes TEXT,
-        subtotal_products INTEGER DEFAULT 0, subtotal_services_exempt INTEGER DEFAULT 0,
-        vat_products INTEGER DEFAULT 0, total INTEGER DEFAULT 0,
-        sent_date TEXT, approved_date TEXT
-    );
-    CREATE TABLE IF NOT EXISTS quote_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, quote_id INTEGER NOT NULL,
-        item_type TEXT NOT NULL, sku TEXT, description TEXT NOT NULL,
-        quantity INTEGER DEFAULT 1, unit_price INTEGER DEFAULT 0,
-        line_total INTEGER DEFAULT 0, vat_exempt INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS sales (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, sale_date TEXT NOT NULL,
-        client_id INTEGER, quote_id INTEGER, total INTEGER DEFAULT 0,
-        material_cost INTEGER DEFAULT 0, gross_margin INTEGER DEFAULT 0,
-        gross_margin_pct REAL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS billing (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER, client_id INTEGER,
-        total INTEGER DEFAULT 0, advance_50 INTEGER DEFAULT 0, balance_50 INTEGER DEFAULT 0,
-        payment_status TEXT DEFAULT 'Pendiente'
-    );
-    CREATE TABLE IF NOT EXISTS warranties (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER,
-        sale_id INTEGER UNIQUE, install_date TEXT, warranty_months INTEGER DEFAULT 6,
-        expiry_date TEXT, status TEXT DEFAULT 'Vigente', notes TEXT
-    );
-    CREATE TABLE IF NOT EXISTS installations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL,
-        install_date TEXT NOT NULL, sku TEXT, description TEXT NOT NULL,
-        serial_number TEXT, location TEXT, notes TEXT, warranty_months INTEGER DEFAULT 12
-    );
-    CREATE TABLE IF NOT EXISTS kits (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL, sale_price INTEGER DEFAULT 0, notes TEXT
-    );
-    CREATE TABLE IF NOT EXISTS kit_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, kit_id INTEGER NOT NULL,
-        sku TEXT NOT NULL, quantity INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS work_orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ot_number TEXT NOT NULL,
-        client_id INTEGER, vendor_id INTEGER, quote_id INTEGER,
-        status TEXT DEFAULT 'Pendiente', scheduled_date TEXT, address TEXT,
-        hours_work REAL DEFAULT 0, labor_cost INTEGER DEFAULT 0,
-        travel_cost INTEGER DEFAULT 0, extra_material_cost INTEGER DEFAULT 0, notes TEXT
-    );
-    CREATE TABLE IF NOT EXISTS work_order_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, work_order_id INTEGER NOT NULL,
-        sku TEXT, description TEXT, quantity INTEGER DEFAULT 1,
-        cost_unit INTEGER DEFAULT 0, line_cost INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS inventory_movements (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, sku TEXT NOT NULL,
-        movement_type TEXT NOT NULL, quantity INTEGER DEFAULT 0,
-        reference_type TEXT, reference_id INTEGER, notes TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS projects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, project_number TEXT NOT NULL,
-        quotation_id INTEGER, client_id INTEGER, name TEXT, description TEXT,
-        status TEXT DEFAULT 'Pendiente', technical_status TEXT DEFAULT 'Pendiente',
-        installation_date TEXT, delivery_date TEXT, configuration_url TEXT, notes TEXT,
-        checklist_required INTEGER DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP, is_active INTEGER DEFAULT 1
-    );
-    CREATE TABLE IF NOT EXISTS project_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
-        item_type TEXT NOT NULL, sku TEXT, description TEXT NOT NULL,
-        quantity INTEGER DEFAULT 1, unit_cost INTEGER DEFAULT 0,
-        unit_price INTEGER DEFAULT 0, total_price INTEGER DEFAULT 0,
-        reserved_quantity INTEGER DEFAULT 0, used_quantity INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS checklist_templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        description TEXT, service_type TEXT, is_active INTEGER DEFAULT 1,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS checklist_template_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, template_id INTEGER NOT NULL,
-        item_order INTEGER DEFAULT 1, item_text TEXT NOT NULL,
-        is_required INTEGER DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS project_checklists (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
-        template_id INTEGER, status TEXT DEFAULT 'Pendiente',
-        completed_at TEXT, completed_by TEXT, notes TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS project_checklist_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, project_checklist_id INTEGER NOT NULL,
-        item_text TEXT NOT NULL, is_required INTEGER DEFAULT 1,
-        is_checked INTEGER DEFAULT 0, checked_at TEXT, evidence_note TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS purchase_batches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, supplier_name TEXT, purchase_date TEXT,
-        shipping_cost INTEGER DEFAULT 0, customs_cost INTEGER DEFAULT 0,
-        other_costs INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS purchase_batch_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL,
-        product_sku TEXT NOT NULL, quantity INTEGER DEFAULT 1,
-        unit_price INTEGER DEFAULT 0, landed_cost INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS tools_assets (
-        asset_id TEXT PRIMARY KEY, tool_name TEXT NOT NULL,
-        category TEXT DEFAULT 'Herramienta', provider TEXT,
-        quantity INTEGER DEFAULT 1, cost_unit INTEGER DEFAULT 0,
-        purchase_date TEXT DEFAULT '', useful_life_months INTEGER DEFAULT 12,
-        monthly_cost INTEGER DEFAULT 0, status TEXT DEFAULT 'Activa',
-        notes TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_name_unique ON suppliers(name);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_supplies_desc_unique ON supplies_catalog(description);
-    """)
-    conn.commit()
-
-    ensure_column(conn, "inventory", "stock_reserved", "INTEGER DEFAULT 0")
-    ensure_column(conn, "inventory", "average_landed_cost", "INTEGER DEFAULT 0")
-    ensure_column(conn, "clients", "rut", "TEXT")
-    ensure_column(conn, "clients", "notes", "TEXT")
-    ensure_column(conn, "quotes", "sent_date", "TEXT")
-    ensure_column(conn, "quotes", "approved_date", "TEXT")
-
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM checklist_templates")
-    if cur.fetchone()[0] == 0:
-        cur.execute("INSERT INTO checklist_templates (name, description, service_type) VALUES (?,?,?)",
-                    ("Entrega Domótica Abaroa Smart", "Checklist base para cierre y entrega profesional.", "domotica"))
-        tid = cur.lastrowid
-        for idx, item in enumerate([
-            "¿Se verificó la carga de los automáticos (RIC)?",
-            "¿Los dispositivos Zigbee tienen señal estable?",
-            "¿El cliente tiene la app configurada en su móvil?",
-            "¿Se probó encendido y apagado manual y desde la app?",
-            "¿Se dejó respaldo o enlace de configuración del sistema?",
-            "¿Se explicó operación básica y garantía al cliente?"
-        ], start=1):
-            cur.execute("INSERT INTO checklist_template_items (template_id, item_order, item_text, is_required) VALUES (?,?,?,1)", (tid, idx, item))
-
-    cur.execute("SELECT COUNT(*) FROM vendors")
-    if cur.fetchone()[0] == 0:
-        cur.execute("INSERT INTO vendors (name, email, phone, role) VALUES ('Abaroa Smart','','','Ventas')")
-
-    cur.execute("SELECT COUNT(*) FROM app_settings WHERE key='admin_username'")
-    if cur.fetchone()[0] == 0:
-        cur.execute("INSERT OR IGNORE INTO app_settings (key,value) VALUES ('admin_username','admin')")
-        cur.execute("INSERT OR IGNORE INTO app_settings (key,value) VALUES ('admin_password_hash',?)", (hash_password("admin123"),))
-
+        cur = conn.execute("""
+            INSERT INTO clients (name,rut,phone,email,address,commune,region,notes)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (data["name"], data.get("rut",""), data.get("phone",""), data.get("email",""),
+              data.get("address",""), data.get("commune",""), data.get("region",""),
+              data.get("notes","")))
+        rid = cur.lastrowid
     conn.commit()
     conn.close()
+    return rid
+
+
+def delete_client(client_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM clients WHERE id=?", (client_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Vendedores
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_vendors(active_only: bool = True) -> list:
+    conn = get_conn()
+    q = "SELECT * FROM vendors"
+    q += " WHERE active=1" if active_only else ""
+    q += " ORDER BY name"
+    rows = conn.execute(q).fetchall()
+    conn.close()
+    return rows
+
+
+def get_vendor(vendor_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def upsert_vendor(data: dict) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE vendors SET name=?,phone=?,email=?,commission=?,active=? WHERE id=?
+        """, (data["name"], data.get("phone",""), data.get("email",""),
+              data.get("commission", 0), int(data.get("active", 1)), data["id"]))
+        rid = data["id"]
+    else:
+        cur = conn.execute("""
+            INSERT INTO vendors (name,phone,email,commission,active)
+            VALUES (?,?,?,?,?)
+        """, (data["name"], data.get("phone",""), data.get("email",""),
+              data.get("commission", 0), int(data.get("active", 1))))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Proveedores
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_suppliers(search: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    rows = conn.execute(
+        "SELECT * FROM suppliers WHERE name LIKE ? OR email LIKE ? ORDER BY name",
+        (q, q),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_supplier(supplier_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM suppliers WHERE id=?", (supplier_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def upsert_supplier(data: dict) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE suppliers SET name=?,contact=?,phone=?,email=?,address=?,notes=? WHERE id=?
+        """, (data["name"], data.get("contact",""), data.get("phone",""),
+              data.get("email",""), data.get("address",""), data.get("notes",""), data["id"]))
+        rid = data["id"]
+    else:
+        cur = conn.execute("""
+            INSERT INTO suppliers (name,contact,phone,email,address,notes)
+            VALUES (?,?,?,?,?,?)
+        """, (data["name"], data.get("contact",""), data.get("phone",""),
+              data.get("email",""), data.get("address",""), data.get("notes","")))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def delete_supplier(supplier_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM suppliers WHERE id=?", (supplier_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Productos (Inventario)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_products(search: str = "", active_only: bool = True, category: str = "") -> list:
+    conn = get_conn()
+    q_like = "%" + search + "%"
+    where = "WHERE (p.name LIKE ? OR p.sku LIKE ? OR p.brand LIKE ? OR p.description LIKE ?)"
+    params: list = [q_like, q_like, q_like, q_like]
+    if active_only:
+        where += " AND p.active=1"
+    if category:
+        where += " AND p.category=?"
+        params.append(category)
+    rows = conn.execute(f"""
+        SELECT p.*, s.name AS supplier_name
+        FROM products p LEFT JOIN suppliers s ON s.id=p.supplier_id
+        {where}
+        ORDER BY p.name
+    """, params).fetchall()
+    conn.close()
+    return rows
+
+
+def get_product(product_id: int):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT p.*, s.name AS supplier_name FROM products p LEFT JOIN suppliers s ON s.id=p.supplier_id WHERE p.id=?",
+        (product_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_product_by_sku(sku: str):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM products WHERE sku=?", (sku,)).fetchone()
+    conn.close()
+    return row
+
+
+def upsert_product(data: dict) -> int:
+    cost = float(data.get("cost_price", 0))
+    margin = float(data.get("margin", 30))
+    sale = round(cost * (1 + margin / 100), 0)
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE products SET sku=?,name=?,description=?,category=?,brand=?,model=?,unit=?,
+            cost_price=?,margin=?,sale_price=?,stock=?,stock_min=?,stock_max=?,location=?,
+            supplier_id=?,vat_exempt=?,active=?,notes=?,updated_at=datetime('now','localtime')
+            WHERE id=?
+        """, (data["sku"], data["name"], data.get("description",""), data.get("category",""),
+              data.get("brand",""), data.get("model",""), data.get("unit","un"),
+              cost, margin, sale, data.get("stock",0), data.get("stock_min",0),
+              data.get("stock_max",0), data.get("location",""), data.get("supplier_id"),
+              int(data.get("vat_exempt",0)), int(data.get("active",1)), data.get("notes",""),
+              data["id"]))
+        rid = data["id"]
+    else:
+        cur = conn.execute("""
+            INSERT INTO products (sku,name,description,category,brand,model,unit,
+            cost_price,margin,sale_price,stock,stock_min,stock_max,location,
+            supplier_id,vat_exempt,active,notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (data["sku"], data["name"], data.get("description",""), data.get("category",""),
+              data.get("brand",""), data.get("model",""), data.get("unit","un"),
+              cost, margin, sale, data.get("stock",0), data.get("stock_min",0),
+              data.get("stock_max",0), data.get("location",""), data.get("supplier_id"),
+              int(data.get("vat_exempt",0)), int(data.get("active",1)), data.get("notes","")))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def delete_product(product_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE products SET active=0 WHERE id=?", (product_id,))
+    conn.commit()
+    conn.close()
+
+
+def adjust_stock(product_id: int, quantity: float, movement_type: str = "ajuste",
+                 ref_type: str = "", ref_id: int | None = None, notes: str = ""):
+    """Registra un movimiento de stock y actualiza el campo stock del producto."""
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO stock_movements (product_id, movement_type, quantity, reference_type, reference_id, notes)
+        VALUES (?,?,?,?,?,?)
+    """, (product_id, movement_type, abs(quantity), ref_type, ref_id, notes))
+    # Actualizar stock directamente
+    sign = -1 if movement_type in ("salida", "uso_ot", "uso_proyecto") else 1
+    conn.execute(
+        "UPDATE products SET stock = MAX(0, stock + ?) WHERE id=?",
+        (sign * abs(quantity), product_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_product_categories() -> list[str]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT category FROM products WHERE category!='' AND active=1 ORDER BY category"
+    ).fetchall()
+    conn.close()
+    return [r["category"] for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Herramientas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_tools(search: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    rows = conn.execute(
+        "SELECT * FROM tools WHERE (name LIKE ? OR serial LIKE ? OR brand LIKE ?) AND active=1 ORDER BY name",
+        (q, q, q),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def upsert_tool(data: dict) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE tools SET name=?,serial=?,brand=?,model=?,category=?,condition=?,
+            location=?,purchase_date=?,purchase_price=?,assigned_to=?,notes=?,active=?
+            WHERE id=?
+        """, (data["name"], data.get("serial",""), data.get("brand",""), data.get("model",""),
+              data.get("category",""), data.get("condition","bueno"), data.get("location",""),
+              data.get("purchase_date",""), data.get("purchase_price",0),
+              data.get("assigned_to",""), data.get("notes",""), int(data.get("active",1)),
+              data["id"]))
+        rid = data["id"]
+    else:
+        cur = conn.execute("""
+            INSERT INTO tools (name,serial,brand,model,category,condition,location,
+            purchase_date,purchase_price,assigned_to,notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (data["name"], data.get("serial",""), data.get("brand",""), data.get("model",""),
+              data.get("category",""), data.get("condition","bueno"), data.get("location",""),
+              data.get("purchase_date",""), data.get("purchase_price",0),
+              data.get("assigned_to",""), data.get("notes","")))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def delete_tool(tool_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE tools SET active=0 WHERE id=?", (tool_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Insumos
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_supplies(search: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    rows = conn.execute("""
+        SELECT s.*, sup.name AS supplier_name
+        FROM supplies s LEFT JOIN suppliers sup ON sup.id=s.supplier_id
+        WHERE (s.name LIKE ? OR s.sku LIKE ?) AND s.active=1
+        ORDER BY s.name
+    """, (q, q)).fetchall()
+    conn.close()
+    return rows
+
+
+def upsert_supply(data: dict) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE supplies SET name=?,sku=?,category=?,unit=?,cost_price=?,sale_price=?,
+            stock=?,stock_min=?,supplier_id=?,notes=?,active=? WHERE id=?
+        """, (data["name"], data.get("sku",""), data.get("category",""), data.get("unit","un"),
+              data.get("cost_price",0), data.get("sale_price",0), data.get("stock",0),
+              data.get("stock_min",0), data.get("supplier_id"), data.get("notes",""),
+              int(data.get("active",1)), data["id"]))
+        rid = data["id"]
+    else:
+        cur = conn.execute("""
+            INSERT INTO supplies (name,sku,category,unit,cost_price,sale_price,stock,stock_min,supplier_id,notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (data["name"], data.get("sku",""), data.get("category",""), data.get("unit","un"),
+              data.get("cost_price",0), data.get("sale_price",0), data.get("stock",0),
+              data.get("stock_min",0), data.get("supplier_id"), data.get("notes","")))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def delete_supply(supply_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE supplies SET active=0 WHERE id=?", (supply_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Kits
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_kits(search: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    rows = conn.execute(
+        "SELECT * FROM kits WHERE (name LIKE ? OR description LIKE ?) AND active=1 ORDER BY name",
+        (q, q),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_kit(kit_id: int):
+    conn = get_conn()
+    kit = conn.execute("SELECT * FROM kits WHERE id=?", (kit_id,)).fetchone()
+    items = conn.execute("""
+        SELECT ki.*, p.name AS product_name, p.sku AS product_sku,
+               s.name AS supply_name
+        FROM kit_items ki
+        LEFT JOIN products p ON p.id=ki.product_id
+        LEFT JOIN supplies s ON s.id=ki.supply_id
+        WHERE ki.kit_id=?
+        ORDER BY ki.id
+    """, (kit_id,)).fetchall()
+    conn.close()
+    return kit, items
+
+
+def upsert_kit(data: dict, items: list[dict]) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE kits SET name=?,description=?,category=?,sale_price=?,margin=?,active=?,notes=?
+            WHERE id=?
+        """, (data["name"], data.get("description",""), data.get("category",""),
+              data.get("sale_price",0), data.get("margin",30),
+              int(data.get("active",1)), data.get("notes",""), data["id"]))
+        kit_id = data["id"]
+        conn.execute("DELETE FROM kit_items WHERE kit_id=?", (kit_id,))
+    else:
+        cur = conn.execute("""
+            INSERT INTO kits (name,description,category,sale_price,margin,active,notes)
+            VALUES (?,?,?,?,?,?,?)
+        """, (data["name"], data.get("description",""), data.get("category",""),
+              data.get("sale_price",0), data.get("margin",30),
+              int(data.get("active",1)), data.get("notes","")))
+        kit_id = cur.lastrowid
+
+    for item in items:
+        lt = float(item.get("quantity",1)) * float(item.get("unit_price",0))
+        conn.execute("""
+            INSERT INTO kit_items (kit_id,product_id,supply_id,description,quantity,unit_price,line_total)
+            VALUES (?,?,?,?,?,?,?)
+        """, (kit_id, item.get("product_id"), item.get("supply_id"),
+              item.get("description",""), item.get("quantity",1),
+              item.get("unit_price",0), lt))
+    conn.commit()
+    conn.close()
+    return kit_id
+
+
+def delete_kit(kit_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE kits SET active=0 WHERE id=?", (kit_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Cotizaciones
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_quotes(search: str = "", status: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    where = "WHERE (qu.quote_number LIKE ? OR c.name LIKE ?)"
+    params: list = [q, q]
+    if status:
+        where += " AND qu.status=?"
+        params.append(status)
+    rows = conn.execute(f"""
+        SELECT qu.*, c.name AS client_name, v.name AS vendor_name
+        FROM quotes qu
+        LEFT JOIN clients c ON c.id=qu.client_id
+        LEFT JOIN vendors v ON v.id=qu.vendor_id
+        {where}
+        ORDER BY qu.id DESC
+    """, params).fetchall()
+    conn.close()
+    return rows
+
+
+def get_quote(quote_id: int):
+    conn = get_conn()
+    quote = conn.execute("""
+        SELECT qu.*, c.name AS client_name, c.phone AS client_phone,
+               c.email AS client_email, c.address AS client_address, c.rut AS client_rut,
+               v.name AS vendor_name
+        FROM quotes qu
+        LEFT JOIN clients c ON c.id=qu.client_id
+        LEFT JOIN vendors v ON v.id=qu.vendor_id
+        WHERE qu.id=?
+    """, (quote_id,)).fetchone()
+    items = conn.execute(
+        "SELECT * FROM quote_items WHERE quote_id=? ORDER BY sort_order, id",
+        (quote_id,),
+    ).fetchall()
+    conn.close()
+    return quote, items
+
+
+def upsert_quote(data: dict, items: list[dict]) -> int:
+    """Crea o actualiza una cotización con sus líneas."""
+    vat_rate = float(get_setting("vat_rate", "19")) / 100
+    conn = get_conn()
+
+    subtotal = sum(float(i.get("line_total", 0)) for i in items)
+    vat = sum(
+        float(i.get("line_total", 0)) * vat_rate
+        for i in items if not i.get("vat_exempt", 0)
+    )
+    total = subtotal + vat
+
+    if data.get("id"):
+        conn.execute("""
+            UPDATE quotes SET client_id=?,vendor_id=?,quote_date=?,valid_until=?,status=?,
+            subtotal=?,vat_amount=?,total=?,notes=?,terms=?,updated_at=datetime('now','localtime')
+            WHERE id=?
+        """, (data.get("client_id"), data.get("vendor_id"), data.get("quote_date", str(date.today())),
+              data.get("valid_until",""), data.get("status","borrador"),
+              subtotal, vat, total, data.get("notes",""), data.get("terms",""), data["id"]))
+        qid = data["id"]
+        conn.execute("DELETE FROM quote_items WHERE quote_id=?", (qid,))
+    else:
+        quote_number = data.get("quote_number") or next_quote_number()
+        cur = conn.execute("""
+            INSERT INTO quotes (quote_number,client_id,vendor_id,quote_date,valid_until,status,
+            subtotal,vat_amount,total,notes,terms)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (quote_number, data.get("client_id"), data.get("vendor_id"),
+              data.get("quote_date", str(date.today())), data.get("valid_until",""),
+              data.get("status","borrador"), subtotal, vat, total,
+              data.get("notes",""), data.get("terms","")))
+        qid = cur.lastrowid
+
+    for idx, item in enumerate(items):
+        lt = float(item.get("quantity",1)) * float(item.get("unit_price",0))
+        lt *= (1 - float(item.get("discount",0)) / 100)
+        conn.execute("""
+            INSERT INTO quote_items (quote_id,item_type,product_id,kit_id,supply_id,description,
+            quantity,unit_price,discount,line_total,vat_exempt,sort_order)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (qid, item.get("item_type","producto"), item.get("product_id"),
+              item.get("kit_id"), item.get("supply_id"), item.get("description",""),
+              item.get("quantity",1), item.get("unit_price",0), item.get("discount",0),
+              lt, int(item.get("vat_exempt",0)), idx))
+    conn.commit()
+    conn.close()
+    return qid
+
+
+def update_quote_status(quote_id: int, status: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE quotes SET status=?, updated_at=datetime('now','localtime') WHERE id=?",
+        (status, quote_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_quote(quote_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM quotes WHERE id=?", (quote_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Ventas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_sales(search: str = "", status: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    where = "WHERE (s.sale_number LIKE ? OR c.name LIKE ?)"
+    params: list = [q, q]
+    if status:
+        where += " AND s.payment_status=?"
+        params.append(status)
+    rows = conn.execute(f"""
+        SELECT s.*, c.name AS client_name, v.name AS vendor_name
+        FROM sales s
+        LEFT JOIN clients c ON c.id=s.client_id
+        LEFT JOIN vendors v ON v.id=s.vendor_id
+        {where}
+        ORDER BY s.id DESC
+    """, params).fetchall()
+    conn.close()
+    return rows
+
+
+def get_sale(sale_id: int):
+    conn = get_conn()
+    sale = conn.execute("""
+        SELECT s.*, c.name AS client_name, v.name AS vendor_name
+        FROM sales s
+        LEFT JOIN clients c ON c.id=s.client_id
+        LEFT JOIN vendors v ON v.id=s.vendor_id
+        WHERE s.id=?
+    """, (sale_id,)).fetchone()
+    items = conn.execute(
+        "SELECT * FROM sale_items WHERE sale_id=? ORDER BY id", (sale_id,)
+    ).fetchall()
+    conn.close()
+    return sale, items
+
+
+def create_sale_from_quote(quote_id: int, payment_method: str = "transferencia") -> int:
+    """Convierte una cotización aprobada en venta."""
+    quote, q_items = get_quote(quote_id)
+    if not quote:
+        raise ValueError(f"Cotización {quote_id} no encontrada")
+
+    sale_number = next_sale_number()
+    conn = get_conn()
+    cur = conn.execute("""
+        INSERT INTO sales (sale_number,quote_id,client_id,vendor_id,sale_date,payment_method,
+        payment_status,subtotal,vat_amount,total,amount_paid,balance_due)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (sale_number, quote_id, quote["client_id"], quote["vendor_id"],
+          str(date.today()), payment_method, "pendiente",
+          quote["subtotal"], quote["vat_amount"], quote["total"], 0, quote["total"]))
+    sale_id = cur.lastrowid
+
+    for item in q_items:
+        conn.execute("""
+            INSERT INTO sale_items (sale_id,item_type,description,quantity,unit_price,line_total,vat_exempt)
+            VALUES (?,?,?,?,?,?,?)
+        """, (sale_id, item["item_type"], item["description"],
+              item["quantity"], item["unit_price"], item["line_total"], item["vat_exempt"]))
+
+    # Marcar cotización como aprobada
+    conn.execute(
+        "UPDATE quotes SET status='aprobada', updated_at=datetime('now','localtime') WHERE id=?",
+        (quote_id,),
+    )
+    conn.commit()
+    conn.close()
+    return sale_id
+
+
+def register_payment(sale_id: int, amount: float):
+    conn = get_conn()
+    conn.execute("""
+        UPDATE sales SET
+          amount_paid = MIN(total, amount_paid + ?),
+          balance_due = MAX(0, total - amount_paid - ?),
+          payment_status = CASE
+            WHEN (amount_paid + ?) >= total THEN 'pagado'
+            WHEN (amount_paid + ?) > 0      THEN 'parcial'
+            ELSE 'pendiente' END
+        WHERE id=?
+    """, (amount, amount, amount, amount, sale_id))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Proyectos
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_projects(search: str = "", status: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    where = "WHERE (p.project_number LIKE ? OR p.name LIKE ? OR c.name LIKE ?)"
+    params: list = [q, q, q]
+    if status:
+        where += " AND p.status=?"
+        params.append(status)
+    rows = conn.execute(f"""
+        SELECT p.*, c.name AS client_name, v.name AS vendor_name
+        FROM projects p
+        LEFT JOIN clients c ON c.id=p.client_id
+        LEFT JOIN vendors v ON v.id=p.vendor_id
+        {where}
+        ORDER BY p.id DESC
+    """, params).fetchall()
+    conn.close()
+    return rows
+
+
+def get_project(project_id: int):
+    conn = get_conn()
+    project = conn.execute("""
+        SELECT p.*, c.name AS client_name, c.phone AS client_phone,
+               c.email AS client_email, c.address AS client_address,
+               v.name AS vendor_name, q.quote_number
+        FROM projects p
+        LEFT JOIN clients c ON c.id=p.client_id
+        LEFT JOIN vendors v ON v.id=p.vendor_id
+        LEFT JOIN quotes q ON q.id=p.quotation_id
+        WHERE p.id=?
+    """, (project_id,)).fetchone()
+    items = conn.execute(
+        "SELECT * FROM project_items WHERE project_id=? ORDER BY id", (project_id,)
+    ).fetchall()
+    conn.close()
+    return project, items
+
+
+def upsert_project(data: dict) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE projects SET name=?,client_id=?,vendor_id=?,quotation_id=?,status=?,priority=?,
+            start_date=?,installation_date=?,delivery_date=?,end_date=?,address=?,description=?,
+            technician=?,progress_pct=?,notes=?,updated_at=datetime('now','localtime')
+            WHERE id=?
+        """, (data["name"], data.get("client_id"), data.get("vendor_id"), data.get("quotation_id"),
+              data.get("status","planificado"), data.get("priority","normal"),
+              data.get("start_date",""), data.get("installation_date",""),
+              data.get("delivery_date",""), data.get("end_date",""),
+              data.get("address",""), data.get("description",""),
+              data.get("technician",""), data.get("progress_pct",0),
+              data.get("notes",""), data["id"]))
+        rid = data["id"]
+    else:
+        project_number = data.get("project_number") or next_project_number()
+        cur = conn.execute("""
+            INSERT INTO projects (project_number,name,client_id,vendor_id,quotation_id,status,priority,
+            start_date,installation_date,delivery_date,end_date,address,description,technician,
+            progress_pct,notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (project_number, data["name"], data.get("client_id"), data.get("vendor_id"),
+              data.get("quotation_id"), data.get("status","planificado"),
+              data.get("priority","normal"), data.get("start_date",""),
+              data.get("installation_date",""), data.get("delivery_date",""),
+              data.get("end_date",""), data.get("address",""), data.get("description",""),
+              data.get("technician",""), data.get("progress_pct",0), data.get("notes","")))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def update_project_status(project_id: int, status: str, progress: int | None = None):
+    conn = get_conn()
+    if progress is not None:
+        conn.execute(
+            "UPDATE projects SET status=?, progress_pct=?, updated_at=datetime('now','localtime') WHERE id=?",
+            (status, progress, project_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE projects SET status=?, updated_at=datetime('now','localtime') WHERE id=?",
+            (status, project_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def delete_project(project_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    conn.commit()
+    conn.close()
+
+
+def add_project_log(project_id: int, content: str, log_type: str = "nota", author: str = ""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO project_logs (project_id, log_type, content, author) VALUES (?,?,?,?)",
+        (project_id, log_type, content, author),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_project_logs(project_id: int) -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM project_logs WHERE project_id=? ORDER BY created_at DESC",
+        (project_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Órdenes de Trabajo (OT)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_work_orders(search: str = "", status: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    where = "WHERE (wo.ot_number LIKE ? OR c.name LIKE ? OR wo.technician LIKE ?)"
+    params: list = [q, q, q]
+    if status:
+        where += " AND wo.status=?"
+        params.append(status)
+    rows = conn.execute(f"""
+        SELECT wo.*, c.name AS client_name, p.project_number
+        FROM work_orders wo
+        LEFT JOIN clients c ON c.id=wo.client_id
+        LEFT JOIN projects p ON p.id=wo.project_id
+        {where}
+        ORDER BY wo.id DESC
+    """, params).fetchall()
+    conn.close()
+    return rows
+
+
+def get_work_order(ot_id: int):
+    conn = get_conn()
+    ot = conn.execute("""
+        SELECT wo.*, c.name AS client_name, c.phone AS client_phone,
+               c.email AS client_email, c.address AS client_address,
+               p.project_number
+        FROM work_orders wo
+        LEFT JOIN clients c ON c.id=wo.client_id
+        LEFT JOIN projects p ON p.id=wo.project_id
+        WHERE wo.id=?
+    """, (ot_id,)).fetchone()
+    items = conn.execute(
+        "SELECT * FROM ot_items WHERE ot_id=? ORDER BY id", (ot_id,)
+    ).fetchall()
+    conn.close()
+    return ot, items
+
+
+def upsert_work_order(data: dict) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE work_orders SET client_id=?,project_id=?,vendor_id=?,type=?,status=?,priority=?,
+            scheduled_date=?,start_date=?,end_date=?,description=?,technician=?,address=?,
+            diagnosis=?,solution=?,travel_km=?,labor_hours=?,labor_rate=?,parts_cost=?,total_cost=?,
+            notes=?,updated_at=datetime('now','localtime')
+            WHERE id=?
+        """, (data.get("client_id"), data.get("project_id"), data.get("vendor_id"),
+              data.get("type","instalación"), data.get("status","abierta"),
+              data.get("priority","normal"), data.get("scheduled_date",""),
+              data.get("start_date",""), data.get("end_date",""),
+              data.get("description",""), data.get("technician",""), data.get("address",""),
+              data.get("diagnosis",""), data.get("solution",""),
+              data.get("travel_km",0), data.get("labor_hours",0), data.get("labor_rate",0),
+              data.get("parts_cost",0), data.get("total_cost",0),
+              data.get("notes",""), data["id"]))
+        rid = data["id"]
+    else:
+        ot_number = data.get("ot_number") or next_ot_number()
+        cur = conn.execute("""
+            INSERT INTO work_orders (ot_number,client_id,project_id,vendor_id,type,status,priority,
+            scheduled_date,start_date,end_date,description,technician,address,
+            diagnosis,solution,travel_km,labor_hours,labor_rate,parts_cost,total_cost,notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (ot_number, data.get("client_id"), data.get("project_id"), data.get("vendor_id"),
+              data.get("type","instalación"), data.get("status","abierta"),
+              data.get("priority","normal"), data.get("scheduled_date",""),
+              data.get("start_date",""), data.get("end_date",""),
+              data.get("description",""), data.get("technician",""), data.get("address",""),
+              data.get("diagnosis",""), data.get("solution",""),
+              data.get("travel_km",0), data.get("labor_hours",0), data.get("labor_rate",0),
+              data.get("parts_cost",0), data.get("total_cost",0), data.get("notes","")))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def update_ot_status(ot_id: int, status: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE work_orders SET status=?, updated_at=datetime('now','localtime') WHERE id=?",
+        (status, ot_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_work_order(ot_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM work_orders WHERE id=?", (ot_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Garantías
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_warranties(search: str = "", status: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    where = "WHERE (w.warranty_number LIKE ? OR c.name LIKE ? OR w.product_name LIKE ?)"
+    params: list = [q, q, q]
+    if status:
+        where += " AND w.status=?"
+        params.append(status)
+    rows = conn.execute(f"""
+        SELECT w.*, c.name AS client_name
+        FROM warranties w LEFT JOIN clients c ON c.id=w.client_id
+        {where}
+        ORDER BY w.id DESC
+    """, params).fetchall()
+    conn.close()
+    return rows
+
+
+def upsert_warranty(data: dict) -> int:
+    conn = get_conn()
+    if data.get("id"):
+        conn.execute("""
+            UPDATE warranties SET client_id=?,project_id=?,ot_id=?,product_name=?,serial_number=?,
+            issue_date=?,expiry_date=?,status=?,description=?,resolution=?,technician=?,notes=?
+            WHERE id=?
+        """, (data.get("client_id"), data.get("project_id"), data.get("ot_id"),
+              data.get("product_name",""), data.get("serial_number",""),
+              data.get("issue_date", str(date.today())), data.get("expiry_date",""),
+              data.get("status","vigente"), data.get("description",""),
+              data.get("resolution",""), data.get("technician",""), data.get("notes",""),
+              data["id"]))
+        rid = data["id"]
+    else:
+        warranty_number = data.get("warranty_number") or next_warranty_number()
+        cur = conn.execute("""
+            INSERT INTO warranties (warranty_number,client_id,project_id,ot_id,product_name,
+            serial_number,issue_date,expiry_date,status,description,resolution,technician,notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (warranty_number, data.get("client_id"), data.get("project_id"), data.get("ot_id"),
+              data.get("product_name",""), data.get("serial_number",""),
+              data.get("issue_date", str(date.today())), data.get("expiry_date",""),
+              data.get("status","vigente"), data.get("description",""),
+              data.get("resolution",""), data.get("technician",""), data.get("notes","")))
+        rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD — Facturas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_invoices(search: str = "") -> list:
+    conn = get_conn()
+    q = "%" + search + "%"
+    rows = conn.execute("""
+        SELECT i.*, c.name AS client_name
+        FROM invoices i LEFT JOIN clients c ON c.id=i.client_id
+        WHERE i.invoice_number LIKE ? OR c.name LIKE ?
+        ORDER BY i.id DESC
+    """, (q, q)).fetchall()
+    conn.close()
+    return rows
+
+
+def create_invoice(sale_id: int, inv_type: str = "boleta") -> int:
+    sale, _ = get_sale(sale_id)
+    if not sale:
+        raise ValueError(f"Venta {sale_id} no encontrada")
+    invoice_number = next_invoice_number()
+    conn = get_conn()
+    cur = conn.execute("""
+        INSERT INTO invoices (invoice_number,sale_id,client_id,invoice_date,type,status,
+        subtotal,vat_amount,total)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, (invoice_number, sale_id, sale["client_id"], str(date.today()),
+          inv_type, "emitida", sale["subtotal"], sale["vat_amount"], sale["total"]))
+    rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard / KPIs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_dashboard_kpis() -> dict:
+    """Retorna métricas principales para la vista de Inicio."""
+    conn = get_conn()
+    today = date.today().isoformat()
+    month_start = date.today().replace(day=1).isoformat()
+
+    total_clients = conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+    total_products = conn.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
+    low_stock_count = conn.execute(
+        "SELECT COUNT(*) FROM products WHERE active=1 AND stock_min>0 AND stock<=stock_min"
+    ).fetchone()[0]
+
+    open_quotes = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(total),0) FROM quotes WHERE status IN ('borrador','enviada')"
+    ).fetchone()
+    month_sales = conn.execute(
+        "SELECT COALESCE(SUM(total),0) FROM sales WHERE sale_date >= ?", (month_start,)
+    ).fetchone()[0]
+    pending_balance = conn.execute(
+        "SELECT COALESCE(SUM(balance_due),0) FROM sales WHERE payment_status IN ('pendiente','parcial')"
+    ).fetchone()[0]
+
+    open_ot = conn.execute(
+        "SELECT COUNT(*) FROM work_orders WHERE status IN ('abierta','en_progreso')"
+    ).fetchone()[0]
+    active_projects = conn.execute(
+        "SELECT COUNT(*) FROM projects WHERE status IN ('planificado','en_progreso')"
+    ).fetchone()[0]
+
+    conn.close()
+    return {
+        "total_clients":    total_clients,
+        "total_products":   total_products,
+        "low_stock_count":  low_stock_count,
+        "open_quotes":      open_quotes[0],
+        "open_quotes_value":open_quotes[1],
+        "month_sales":      month_sales,
+        "pending_balance":  pending_balance,
+        "open_ot":          open_ot,
+        "active_projects":  active_projects,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Respaldo y Restauración
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_db_bytes() -> bytes:
+    """Devuelve el contenido binario de la base de datos para descarga."""
+    with open(str(DB_PATH), "rb") as f:
+        return f.read()
+
+
+def restore_db_from_bytes(data: bytes) -> bool:
+    """Restaura la base de datos desde bytes. Hace backup previo."""
+    backup_path = str(DB_PATH) + ".backup"
+    try:
+        if DB_PATH.exists():
+            import shutil
+            shutil.copy2(str(DB_PATH), backup_path)
+        with open(str(DB_PATH), "wb") as f:
+            f.write(data)
+        # Verificar que el archivo es un SQLite válido
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1")
+        conn.close()
+        return True
+    except Exception:
+        # Revertir al backup
+        if os.path.exists(backup_path):
+            import shutil
+            shutil.copy2(backup_path, str(DB_PATH))
+        return False
+
+
+def get_table_stats() -> dict:
+    """Conteo de registros por tabla para panel de administración."""
+    tables = [
+        "clients", "vendors", "suppliers", "products", "supplies", "tools",
+        "kits", "quotes", "quote_items", "sales", "sale_items", "invoices",
+        "projects", "project_items", "work_orders", "ot_items",
+        "warranties", "purchases", "stock_movements", "audit_log",
+    ]
+    conn = get_conn()
+    stats = {}
+    for t in tables:
+        try:
+            n = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            stats[t] = n
+        except Exception:
+            stats[t] = "N/A"
+    conn.close()
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auditoría
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log_action(action: str, table: str = "", record_id: int | None = None,
+               user: str = "system", detail: str = ""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO audit_log (action, table_name, record_id, user, detail) VALUES (?,?,?,?,?)",
+        (action, table, record_id, user, detail),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_audit_log(limit: int = 100) -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return rows
