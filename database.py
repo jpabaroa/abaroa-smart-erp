@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);
 
 CREATE TABLE IF NOT EXISTS clients (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL, phone TEXT, email TEXT, address TEXT
+    name TEXT NOT NULL, phone TEXT, email TEXT, address TEXT,
+    rut TEXT DEFAULT '', notes TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS vendors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,6 +202,21 @@ def init_db():
     conn = get_conn()
     conn.executescript(_SCHEMA)
     conn.commit()
+    conn.close()
+
+def migrate_db():
+    """Agrega columnas nuevas a tablas existentes sin perder datos."""
+    migrations = [
+        ("clients", "rut",   "TEXT DEFAULT ''"),
+        ("clients", "notes", "TEXT DEFAULT ''"),
+    ]
+    conn = get_conn()
+    for table, col, col_def in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+            conn.commit()
+        except Exception:
+            pass
     conn.close()
 
 def remove_duplicate_rows():
@@ -506,48 +522,28 @@ def delete_quote(quote_id):
     conn.commit(); conn.close()
 
 def delete_project_and_reset_stock(project_id):
-    """
-    Elimina un proyecto de prueba y sus registros asociados,
-    restaurando el stock reservado al inventario.
-    Elimina también la OT y la cotización vinculadas si se solicita.
-    Retorna (ok: bool, mensaje: str, detalle: dict)
-    """
+    """Elimina proyecto, OT y cotización vinculadas restaurando stock reservado."""
     conn = get_conn()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
     if not proj:
         conn.close()
         return False, "Proyecto no encontrado.", {}
-
     detalle = {"proyecto": proj["project_number"], "stock_liberado": [], "ot": None, "cotizacion": None}
-
-    # 1. Restaurar stock reservado de items del proyecto
     items = conn.execute("SELECT * FROM project_items WHERE project_id=?", (project_id,)).fetchall()
     for it in items:
         if it["sku"] and it["sku"] not in ("", "INSUMO"):
             reserved = int(it["reserved_quantity"] or 0)
-            conn.execute(
-                "UPDATE inventory SET stock_reserved=MAX(0,COALESCE(stock_reserved,0)-?), stock_current=COALESCE(stock_current,0)+? WHERE sku=?",
-                (reserved, reserved, it["sku"])
-            )
-            conn.execute(
-                "INSERT INTO inventory_movements(sku,movement_type,quantity,reference_type,reference_id,notes) VALUES(?,?,?,?,?,?)",
-                (it["sku"], "AJUSTE", reserved, "project_delete", project_id, f"Liberación por eliminación proyecto {proj['project_number']}")
-            )
+            conn.execute("UPDATE inventory SET stock_reserved=MAX(0,COALESCE(stock_reserved,0)-?), stock_current=COALESCE(stock_current,0)+? WHERE sku=?",
+                (reserved, reserved, it["sku"]))
+            conn.execute("INSERT INTO inventory_movements(sku,movement_type,quantity,reference_type,reference_id,notes) VALUES(?,?,?,?,?,?)",
+                (it["sku"],"AJUSTE",reserved,"project_delete",project_id,f"Liberación por eliminación proyecto {proj['project_number']}"))
             detalle["stock_liberado"].append(f"{it['sku']} +{reserved}")
-
-    # 2. Eliminar checklist del proyecto
     cl = conn.execute("SELECT id FROM project_checklists WHERE project_id=?", (project_id,)).fetchall()
     for c_row in cl:
         conn.execute("DELETE FROM project_checklist_items WHERE project_checklist_id=?", (c_row["id"],))
     conn.execute("DELETE FROM project_checklists WHERE project_id=?", (project_id,))
-
-    # 3. Eliminar items del proyecto
     conn.execute("DELETE FROM project_items WHERE project_id=?", (project_id,))
-
-    # 4. Eliminar movimientos de inventario asociados
     conn.execute("DELETE FROM inventory_movements WHERE reference_type='project' AND reference_id=?", (project_id,))
-
-    # 5. Eliminar OT asociada
     quote_id = proj["quotation_id"]
     if quote_id:
         ot = conn.execute("SELECT id, ot_number FROM work_orders WHERE quote_id=?", (quote_id,)).fetchone()
@@ -556,20 +552,14 @@ def delete_project_and_reset_stock(project_id):
             conn.execute("DELETE FROM inventory_movements WHERE reference_type='ot' AND reference_id=?", (ot["id"],))
             conn.execute("DELETE FROM work_orders WHERE id=?", (ot["id"],))
             detalle["ot"] = ot["ot_number"]
-
-    # 6. Eliminar el proyecto
     conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
-
-    # 7. Eliminar cotización y sus items
     if quote_id:
         cot = conn.execute("SELECT quote_number FROM quotes WHERE id=?", (quote_id,)).fetchone()
         if cot:
             conn.execute("DELETE FROM quote_items WHERE quote_id=?", (quote_id,))
             conn.execute("DELETE FROM quotes WHERE id=?", (quote_id,))
             detalle["cotizacion"] = cot["quote_number"]
-
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     return True, f"Proyecto {detalle['proyecto']} eliminado.", detalle
 
 def convert_quote_to_sale(quote_id):
