@@ -221,6 +221,7 @@ CREATE TABLE IF NOT EXISTS quote_items (
     product_id      INTEGER REFERENCES products(id) ON DELETE SET NULL,
     kit_id          INTEGER REFERENCES kits(id) ON DELETE SET NULL,
     supply_id       INTEGER REFERENCES supplies(id) ON DELETE SET NULL,
+    sku             TEXT    DEFAULT '',
     description     TEXT    NOT NULL DEFAULT '',
     quantity        REAL    DEFAULT 1,
     unit_price      REAL    DEFAULT 0.0,
@@ -453,6 +454,50 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail      TEXT    DEFAULT '',
     created_at  TEXT    DEFAULT (datetime('now','localtime'))
 );
+
+-- ══════════════════════════════════════════
+--  VISTAS DE COMPATIBILIDAD (esquema legacy)
+--  Las vistas de Python usan los nombres
+--  originales; estas vistas los traducen.
+-- ══════════════════════════════════════════
+DROP VIEW IF EXISTS inventory;
+CREATE VIEW inventory AS
+    SELECT
+        sku,
+        name            AS description,
+        category,
+        notes           AS protocol,
+        stock           AS stock_initial,
+        stock           AS stock_current,
+        cost_price      AS cost_unit,
+        margin          AS margin_pct,
+        sale_price,
+        (SELECT s.name FROM suppliers s WHERE s.id = p.supplier_id) AS provider,
+        vat_exempt      AS is_service,
+        stock_min,
+        image_url       AS image_path,
+        location,
+        0               AS stock_reserved,
+        cost_price      AS average_landed_cost,
+        'NO'            AS publish_web,
+        description     AS description_web,
+        category        AS source_category,
+        ''              AS source_subcategory
+    FROM products p;
+
+DROP VIEW IF EXISTS quotes_legacy;
+CREATE VIEW quotes_legacy AS
+    SELECT
+        id, quote_number, quote_date, client_id, vendor_id,
+        10              AS validity_days,
+        status,
+        notes,
+        subtotal        AS subtotal_products,
+        0               AS subtotal_services_exempt,
+        vat_amount      AS vat_products,
+        total
+    FROM quotes;
+
 """
 
 
@@ -466,6 +511,23 @@ def init_db():
         ("gross_margin",     "REAL DEFAULT 0.0"),
         ("gross_margin_pct", "REAL DEFAULT 0.0"),
     ])
+    _safe_add_columns(conn, "quote_items", [
+        ("sku", "TEXT DEFAULT ''"),
+    ])
+    _safe_add_columns(conn, "project_items", [
+        ("sku", "TEXT DEFAULT ''"),
+    ])
+    # Sincronizar sku desde product_id en quote_items y project_items
+    conn.execute("""
+        UPDATE quote_items SET sku = (
+            SELECT p.sku FROM products p WHERE p.id = quote_items.product_id
+        ) WHERE product_id IS NOT NULL AND (sku IS NULL OR sku = '')
+    """)
+    conn.execute("""
+        UPDATE project_items SET sku = (
+            SELECT p.sku FROM products p WHERE p.id = project_items.product_id
+        ) WHERE product_id IS NOT NULL AND (sku IS NULL OR sku = '')
+    """)
     conn.commit()
     conn.close()
 
