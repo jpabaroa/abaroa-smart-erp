@@ -43,9 +43,15 @@ if "global_search" not in st.session_state: st.session_state["global_search"] = 
 # y el CSS nunca sale de ese iframe.
 
 def inject_sidebar_css(open_: bool = True):
+    """
+    Controla la visibilidad del sidebar via JS → window.parent.document.
+    Mismo mecanismo que apply_theme(): bypasea el sanitizador HTML de Streamlit
+    y el scoping de iframe de st.html().
+    """
+    import streamlit.components.v1 as components
+
     if open_:
         css = """
-        /* ─── DESKTOP: sidebar visible ─────────────────── */
         @media (min-width: 769px) {
             [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
@@ -55,7 +61,6 @@ def inject_sidebar_css(open_: bool = True):
                 transition: transform .25s ease, opacity .2s ease;
             }
         }
-        /* ─── MÓVIL: overlay nativo + nuestro toggle ───── */
         @media (max-width: 768px) {
             [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
@@ -70,13 +75,11 @@ def inject_sidebar_css(open_: bool = True):
                 transition: transform .25s ease;
             }
         }
-        /* ─── LANDSCAPE MÓVIL (<= 768px altura) ────────── */
         @media (max-height: 500px) and (orientation: landscape) {
             section[data-testid="stSidebar"] {
                 position:fixed !important;
                 top:0 !important; left:0 !important; bottom:0 !important;
-                height:100dvh !important;
-                width:260px !important;
+                height:100dvh !important; width:260px !important;
                 z-index:9999 !important;
                 transform:translateX(0) !important;
                 overflow-y:auto !important;
@@ -85,7 +88,6 @@ def inject_sidebar_css(open_: bool = True):
         """
     else:
         css = """
-        /* ─── DESKTOP: sidebar oculto ──────────────────── */
         @media (min-width: 769px) {
             [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
@@ -97,7 +99,6 @@ def inject_sidebar_css(open_: bool = True):
             }
             [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
         }
-        /* ─── MÓVIL: sidebar oculto (fuera de pantalla) ── */
         @media (max-width: 768px) {
             [data-testid="collapsedControl"] { display:none !important; }
             section[data-testid="stSidebar"] {
@@ -111,7 +112,6 @@ def inject_sidebar_css(open_: bool = True):
                 transition: transform .25s ease, opacity .2s ease;
             }
         }
-        /* ─── LANDSCAPE MÓVIL ───────────────────────────── */
         @media (max-height: 500px) and (orientation: landscape) {
             section[data-testid="stSidebar"] {
                 transform:translateX(-110%) !important;
@@ -119,7 +119,23 @@ def inject_sidebar_css(open_: bool = True):
             }
         }
         """
-    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+    css_js = css.replace("\\", "\\\\").replace("`", "\\`")
+    components.html(
+        f"""<script>
+        (function() {{
+          var el = window.parent.document.getElementById('_erp_sidebar_css');
+          if (!el) {{
+            el = window.parent.document.createElement('style');
+            el.id = '_erp_sidebar_css';
+            window.parent.document.head.appendChild(el);
+          }}
+          el.textContent = `{css_js}`;
+        }})();
+        </script>""",
+        height=0,
+        scrolling=False,
+    )
 
 
 inject_sidebar_css(st.session_state.get("sidebar_open", True))

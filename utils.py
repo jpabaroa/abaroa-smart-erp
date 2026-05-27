@@ -57,14 +57,30 @@ def logo(width=200):
 
 # ── TEMA PREMIUM ──────────────────────────────────────────────────────────────
 def apply_theme():
-    # FIX: st.markdown(unsafe_allow_html=True) inyecta el CSS directamente en
-    # el DOM de la página. st.html() lo confinaba a un <iframe> aislado y el
-    # CSS nunca tenía efecto sobre el resto de la aplicación.
-    st.markdown("""
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
-<style>
+    """
+    Inyecta el tema premium via JavaScript al window.parent.document.
+    
+    Historial de métodos de inyección CSS en Streamlit:
+      - st.html()           → crea <iframe> aislado (Streamlit ≥1.36): CSS no llega a la página
+      - st.markdown(unsafe) → strips <style> tags en algunos deployments (Streamlit ≥1.38)
+      - components.html()   → inyecta JS que escribe directamente al <head> del padre ✅
+    
+    El componente se crea con height=0 y scrolling=False para ser invisible.
+    El estilo se asigna a un <style id="_erp_theme"> reutilizable para evitar
+    duplicados en reruns de Streamlit.
+    """
+    import streamlit.components.v1 as components
 
-/* ══════════════════════════════════════════
+    # ── Google Fonts: se carga via st.markdown (solo un <link>, no CSS real)
+    st.markdown(
+        '<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">',
+        unsafe_allow_html=True,
+    )
+
+    # ── CSS completo inyectado al parent document via JS
+    # Esto funciona en TODAS las versiones de Streamlit porque el script
+    # se ejecuta en el iframe del componente y escribe al head del padre.
+    css = r"""/* ══════════════════════════════════════════
    BASE & RESET
 ══════════════════════════════════════════ */
 *, *::before, *::after { box-sizing: border-box; }
@@ -549,13 +565,28 @@ div[data-testid="stHorizontalBlock"]:first-of-type > div[data-testid="column"]:f
 @media (min-width: 769px) and (max-width: 1024px) {
   .block-container { padding-left: .8rem !important; padding-right: .8rem !important; }
   .kpi-value { font-size: 1.45rem; }
-}
+}"""
 
-</style>
-""", unsafe_allow_html=True)
+    # Escapar backticks para no romper el template literal de JS
+    css_js = css.replace("\\\\", "\\\\\\\\").replace("`", "\\`")
+
+    components.html(
+        f"""<script>
+        (function() {{
+          var existing = window.parent.document.getElementById('_erp_theme');
+          if (!existing) {{
+            existing = window.parent.document.createElement('style');
+            existing.id = '_erp_theme';
+            window.parent.document.head.appendChild(existing);
+          }}
+          existing.textContent = `{css_js}`;
+        }})();
+        </script>""",
+        height=0,
+        scrolling=False,
+    )
 
 
-# ── Componentes HTML ──────────────────────────────────────────────────────────
 def form_section(title: str, icon: str = ""):
     prefix = f"{icon} " if icon else ""
     st.markdown(f"""
