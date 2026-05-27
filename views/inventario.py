@@ -29,55 +29,57 @@ def render():
     if sr.button("Ir al primero", use_container_width=True):
         if str(find).strip() and not inv_df.empty:
             needle = find.strip().lower()
-            matches = inv_df[inv_df["sku"].str.lower().str.contains(needle,na=False)
-                           | inv_df["description"].str.lower().str.contains(needle,na=False)]
+            matches = inv_df[
+                inv_df["sku"].str.lower().str.contains(needle, na=False)
+                | inv_df["description"].str.lower().str.contains(needle, na=False)
+            ]
             if not matches.empty:
                 st.session_state["inv_selected"] = str(matches.iloc[0]["sku"])
+                st.session_state["inv_form_v"] = st.session_state.get("inv_form_v", 0) + 1
+                st.rerun()
+            else:
+                st.warning(f"Sin resultados para '{find.strip()}'.")
 
-    # Selector
-    sku_opts = ["Nuevo"] + inv_df["sku"].tolist()
+    # Selector — opciones con SKU + descripción para facilitar identificación
+    sku_list = inv_df["sku"].tolist()
+    desc_map = dict(zip(inv_df["sku"], inv_df["description"].fillna(""))) if not inv_df.empty else {}
+    display_opts = ["Nuevo"] + [
+        f"{sku}  —  {desc_map.get(sku,'')}" if desc_map.get(sku,"") else sku
+        for sku in sku_list
+    ]
+    sku_opts = ["Nuevo"] + sku_list
+
     pending = st.session_state.pop("inv_selected", None)
-    if pending is not None:
-        default_idx = sku_opts.index(pending) if pending in sku_opts else 0
+    if pending is not None and pending in sku_opts:
+        default_idx = sku_opts.index(pending)
     else:
         default_idx = 0
-    selected = st.selectbox("Seleccionar ítem", sku_opts, index=default_idx, key=f"inv_sel_{st.session_state.get('inv_form_v',0)}")
+
+    sel_display = st.selectbox(
+        "Seleccionar ítem",
+        display_opts,
+        index=default_idx,
+        key=f"inv_sel_{st.session_state.get('inv_form_v', 0)}"
+    )
+    # Recuperar SKU limpio desde la opción mostrada
+    selected = sku_opts[display_opts.index(sel_display)]
     current = inv_df[inv_df["sku"] == selected].iloc[0].to_dict() if selected != "Nuevo" and not inv_df.empty and selected in inv_df["sku"].values else {}
 
     # Edición rápida inline
     if selected != "Nuevo" and current:
         with st.expander("⚡ Edición rápida (sin formulario completo)", expanded=False):
-            qc1, qc2, qc3, qc4, qc5 = st.columns(5)
-            q_desc     = qc1.text_input("Descripción", value=str(current.get("description","")), key=f"qd_{selected}")
-            q_cost     = qc2.number_input("Costo unit.", min_value=0, value=int(current.get("cost_unit",0) or 0), step=100, key=f"qc_{selected}")
-            q_margin   = qc3.number_input("Margen %", min_value=0, max_value=100, value=int(current.get("margin_pct",0) or 0), key=f"qm_{selected}")
-            q_stock_min= qc4.number_input("Stock mínimo", min_value=0, value=int(current.get("stock_min",0) or 0), key=f"qsm_{selected}")
+            qc1, qc2, qc3, qc4, qc5, qc6 = st.columns(6)
+            q_desc = qc1.text_input("Descripción", value=str(current.get("description","")), key=f"qd_{selected}")
+            q_cost = qc2.number_input("Costo unit.", min_value=0, value=int(current.get("cost_unit",0) or 0), step=100, key=f"qc_{selected}")
+            q_margin = qc3.number_input("Margen %", min_value=0, max_value=100, value=int(current.get("margin_pct",0) or 0), key=f"qm_{selected}")
+            q_stock_min = qc4.number_input("Stock mínimo", min_value=0, value=int(current.get("stock_min",0) or 0), key=f"qsm_{selected}")
             q_provider = qc5.text_input("Proveedor", value=str(current.get("provider","") or ""), key=f"qp_{selected}")
-            suggested  = calc_sale_price(q_cost, q_margin) if q_cost else 0
-            ri1, ri2, ri3 = st.columns([1, 1, 2])
-            q_is_service = ri1.checkbox(
-                "Es servicio",
-                value=bool(current.get("is_service", 0)),
-                key=f"qsrv_{selected}",
-                help="Marca si este ítem es un servicio (no consume stock)"
-            )
-            ri2.metric("Precio sugerido", money(suggested))
-            q_image_file = ri3.file_uploader(
-                "Reemplazar imagen",
-                type=["png","jpg","jpeg","webp"],
-                key=f"qimg_{selected}",
-                help="Sube una nueva foto para reemplazar la actual"
-            )
+            suggested = calc_sale_price(q_cost, q_margin) if q_cost else 0
+            qc6.metric("Precio sugerido", money(suggested))
             if st.button("💾 Guardar edición rápida", key=f"q_save_{selected}"):
-                image_path = current.get("image_path","") or ""
-                if q_image_file is not None:
-                    image_path = save_inventory_image(q_image_file, selected)
                 conn = get_conn()
-                conn.execute(
-                    "UPDATE inventory SET description=?,cost_unit=?,margin_pct=?,sale_price=?,provider=?,stock_min=?,is_service=?,image_path=? WHERE sku=?",
-                    (q_desc.strip(), int(q_cost), int(q_margin), int(suggested),
-                     q_provider.strip(), int(q_stock_min), 1 if q_is_service else 0, image_path, selected)
-                )
+                conn.execute("UPDATE inventory SET description=?,cost_unit=?,margin_pct=?,sale_price=?,provider=?,stock_min=? WHERE sku=?",
+                             (q_desc.strip(), int(q_cost), int(q_margin), int(suggested), q_provider.strip(), int(q_stock_min), selected))
                 if q_provider.strip():
                     conn.execute("INSERT OR IGNORE INTO suppliers (name) VALUES (?)", (q_provider.strip(),))
                 conn.commit()
@@ -226,71 +228,25 @@ def render():
         for col in ["stock_current","stock_reserved","sold_qty","used_qty"]:
             inv_table[col] = inv_table[col].fillna(0).astype(int)
         inv_table["disponible"] = inv_table["stock_current"] - inv_table["stock_reserved"]
-    edited_table = st.data_editor(
-        inv_table,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        key="inv_bulk_editor",
-        column_config={
-            "category":      st.column_config.TextColumn("Categoría"),
-            "sku":           st.column_config.TextColumn("SKU", disabled=True),
-            "description":   st.column_config.TextColumn("Descripción"),
-            "protocol":      st.column_config.TextColumn("Protocolo"),
-            "location":      st.column_config.TextColumn("Ubicación"),
-            "stock_initial": st.column_config.NumberColumn("Stock inicial", format="%d"),
-            "stock_current": st.column_config.NumberColumn("Stock actual", format="%d", disabled=True),
-            "stock_reserved":st.column_config.NumberColumn("Reservado", format="%d", disabled=True),
-            "stock_min":     st.column_config.NumberColumn("Mínimo", format="%d"),
-            "disponible":    st.column_config.NumberColumn("Disponible", format="%d", disabled=True),
-            "cost_unit":     st.column_config.NumberColumn("Costo", format="$ %d"),
-            "margin_pct":    st.column_config.NumberColumn("Margen %", format="%d%%"),
-            "sale_price":    st.column_config.NumberColumn("Precio venta", format="$ %d", disabled=True),
-            "provider":      st.column_config.TextColumn("Proveedor"),
-            "is_service":    st.column_config.CheckboxColumn("Servicio"),
-            "sold_qty":      st.column_config.NumberColumn("Vendido", format="%d", disabled=True),
-            "used_qty":      st.column_config.NumberColumn("Usado", format="%d", disabled=True),
-        },
-    )
-    if st.button("💾 Guardar cambios de tabla", key="inv_bulk_save"):
-        conn = get_conn()
-        changed = 0
-        for _, row in edited_table.iterrows():
-            sku_val = row["sku"]
-            orig = inv_table[inv_table["sku"] == sku_val]
-            if orig.empty:
-                continue
-            o = orig.iloc[0]
-            if (str(row.get("description","")) != str(o.get("description","")) or
-                str(row.get("category",""))    != str(o.get("category",""))    or
-                str(row.get("protocol",""))    != str(o.get("protocol",""))    or
-                str(row.get("location",""))    != str(o.get("location",""))    or
-                str(row.get("provider",""))    != str(o.get("provider",""))    or
-                int(row.get("cost_unit",0) or 0)   != int(o.get("cost_unit",0) or 0)  or
-                int(row.get("margin_pct",0) or 0)  != int(o.get("margin_pct",0) or 0) or
-                int(row.get("stock_min",0) or 0)   != int(o.get("stock_min",0) or 0)  or
-                bool(row.get("is_service",0))      != bool(o.get("is_service",0))):
-                new_sale = calc_sale_price(int(row.get("cost_unit",0) or 0), int(row.get("margin_pct",0) or 0))
-                conn.execute(
-                    """UPDATE inventory SET description=?,category=?,protocol=?,location=?,
-                       provider=?,cost_unit=?,margin_pct=?,sale_price=?,stock_min=?,is_service=?
-                       WHERE sku=?""",
-                    (str(row.get("description","")), str(row.get("category","")),
-                     str(row.get("protocol","")),    str(row.get("location","")),
-                     str(row.get("provider","")),    int(row.get("cost_unit",0) or 0),
-                     int(row.get("margin_pct",0) or 0), int(new_sale),
-                     int(row.get("stock_min",0) or 0), 1 if bool(row.get("is_service",0)) else 0,
-                     sku_val)
-                )
-                changed += 1
-        conn.commit()
-        conn.close()
-        if changed:
-            recalc_stock()
-            st.success(f"✅ {changed} ítem(s) actualizados desde la tabla.")
-            st.rerun()
-        else:
-            st.info("Sin cambios detectados.")
+    st.dataframe(inv_table, use_container_width=True, hide_index=True, column_config={
+        "category": st.column_config.TextColumn("Categoría"),
+        "sku": st.column_config.TextColumn("SKU"),
+        "description": st.column_config.TextColumn("Descripción"),
+        "protocol": st.column_config.TextColumn("Protocolo"),
+        "location": st.column_config.TextColumn("Ubicación"),
+        "stock_initial": st.column_config.NumberColumn("Stock inicial", format="%d"),
+        "stock_current": st.column_config.NumberColumn("Stock actual", format="%d"),
+        "stock_reserved": st.column_config.NumberColumn("Reservado", format="%d"),
+        "stock_min": st.column_config.NumberColumn("Mínimo", format="%d"),
+        "disponible": st.column_config.NumberColumn("Disponible", format="%d"),
+        "cost_unit": st.column_config.NumberColumn("Costo", format="$ %d"),
+        "margin_pct": st.column_config.NumberColumn("Margen %", format="%d%%"),
+        "sale_price": st.column_config.NumberColumn("Precio venta", format="$ %d"),
+        "provider": st.column_config.TextColumn("Proveedor"),
+        "is_service": st.column_config.CheckboxColumn("Servicio"),
+        "sold_qty": st.column_config.NumberColumn("Vendido", format="%d"),
+        "used_qty": st.column_config.NumberColumn("Usado", format="%d"),
+    })
 
     # Catálogo visual
     st.markdown("### Catálogo visual de bodega")
