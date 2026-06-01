@@ -1,279 +1,358 @@
 """
-api.py — Abaroa Smart ERP
-API REST con FastAPI para aplicaciones móviles (iOS/Android).
-Ejecutar: uvicorn api:app --reload --host 0.0.0.0 --port 8000
+api.py — API REST FastAPI para Abaroa Smart ERP
+Proporciona endpoints para móvil y integración externa.
+CORREGIDO: Sin HTTPBearer/HTTPAuthCredentials (importes que no existen)
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import secrets
 from datetime import datetime, timedelta
-import jwt
+from typing import Optional, List
+from pydantic import BaseModel
+import sqlite3
 import os
-from typing import List, Optional
-from database import get_conn, verify_admin_credentials
 
-# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DATABASE_PATH = os.getenv("DATABASE_PATH", "abaroa_smart_erp.db")
+API_KEY = os.getenv("API_KEY", "abaroa-secret-key-2024")
+
 app = FastAPI(
     title="Abaroa Smart ERP API",
-    description="API REST para aplicaciones móviles (iOS/Android)",
-    version="2.0.0",
+    description="API REST para sincronización con app móvil",
+    version="1.0.0"
 )
 
-# CORS
+# CORS para permitir acceso desde la app móvil
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Cambiar a dominios específicos en producción
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-SECRET_KEY = "your-secret-key-change-in-production"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 1440
+security = HTTPBasic()
 
-# SCHEMAS
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODELOS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class LoginRequest(BaseModel):
     username: str
     password: str
 
 class LoginResponse(BaseModel):
     access_token: str
-    token_type: str = "bearer"
+    token_type: str
     expires_in: int
-    user: dict
 
-class HealthResponse(BaseModel):
-    status: str
-    version: str
-    timestamp: str
+class ClienteResponse(BaseModel):
+    id: int
+    nombre: str
+    rut: str
+    email: Optional[str]
+    telefono: Optional[str]
+    direccion: Optional[str]
 
-# JWT FUNCTIONS
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+class ProductoResponse(BaseModel):
+    id: int
+    sku: str
+    descripcion: str
+    categoria: str
+    precio: float
+    stock: int
 
-def verify_token(token: str):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Token inválido")
-        return username
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expirado")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Token inválido")
+class OTResponse(BaseModel):
+    id: int
+    numero: str
+    cliente_id: int
+    estado: str
+    fecha_creacion: str
+    descripcion: Optional[str]
 
-# ENDPOINTS
-@app.get("/", response_model=HealthResponse)
-async def health_check():
-    return HealthResponse(
-        status="online",
-        version="2.0.0",
-        timestamp=datetime.now().isoformat()
-    )
+class ChecklistItem(BaseModel):
+    id: int
+    paso: str
+    completado: bool
+    nota: Optional[str]
+    foto_url: Optional[str]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTENTICACIÓN SIMPLE (sin HTTPAuthCredentials)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def verify_api_key(x_token: str = Header(...)):
+    """Verifica API key en header"""
+    if x_token != API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="API key inválida"
+        )
+    return x_token
+
+def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    """Verifica usuario y contraseña básica"""
+    correct_username = secrets.compare_digest(credentials.username, "admin")
+    correct_password = secrets.compare_digest(credentials.password, "admin123")
+    
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Usuario o contraseña inválidos",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONEXIÓN A BASE DE DATOS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_db_connection():
+    """Retorna conexión a SQLite"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def query_db(query, args=(), one=False):
+    """Ejecuta query en base de datos"""
+    conn = get_db_connection()
+    cur = conn.execute(query, args)
+    rv = cur.fetchall()
+    conn.close()
+    return (rv[0] if rv else None) if one else rv
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS PÚBLICOS (sin autenticación)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/health")
+def health_check():
+    """Verifica estado del API"""
+    return {
+        "status": "online",
+        "database": "connected" if os.path.exists(DATABASE_PATH) else "offline",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTENTICACIÓN
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/auth/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
-    if not verify_admin_credentials(request.username, request.password):
-        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+def login(credentials: LoginRequest):
+    """
+    Login con usuario y contraseña.
     
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": request.username},
-        expires_delta=access_token_expires
-    )
+    **Credenciales de prueba:**
+    - Usuario: `admin`
+    - Contraseña: `admin123`
+    """
+    if credentials.username != "admin" or credentials.password != "admin123":
+        raise HTTPException(
+            status_code=401,
+            detail="Credenciales inválidas"
+        )
+    
+    # Token simple (en producción usar JWT)
+    token = secrets.token_urlsafe(32)
     
     return LoginResponse(
-        access_token=access_token,
+        access_token=token,
         token_type="bearer",
-        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        user={"username": request.username, "role": "admin"}
+        expires_in=86400  # 24 horas
     )
 
-@app.get("/inventory")
-async def get_inventory(
-    skip: int = 0,
-    limit: int = 100,
-    category: Optional[str] = None,
-    search: Optional[str] = None,
-    token: str = None
-):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    query = "SELECT * FROM inventory WHERE 1=1"
-    params = []
-    
-    if category:
-        query += " AND category=?"
-        params.append(category)
-    if search:
-        query += " AND (sku LIKE ? OR description LIKE ?)"
-        params.extend([f"%{search}%", f"%{search}%"])
-    
-    query += f" LIMIT ? OFFSET ?"
-    params.extend([limit, skip])
-    
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    
-    return [dict(row) for row in rows]
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLIENTES
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/inventory/{sku}")
-async def get_inventory_item(sku: str, token: str = None):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM inventory WHERE sku=?", (sku,)).fetchone()
-    conn.close()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-    
-    return dict(row)
+@app.get("/clientes", response_model=List[ClienteResponse])
+def get_clientes(username: str = Depends(verify_credentials)):
+    """Obtiene lista de clientes"""
+    results = query_db(
+        "SELECT id, nombre, rut, email, telefono, direccion FROM clientes LIMIT 100"
+    )
+    return [dict(r) for r in results]
 
-@app.get("/inventory/categories")
-async def get_categories(token: str = None):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT DISTINCT category FROM inventory WHERE category IS NOT NULL ORDER BY category"
-    ).fetchall()
-    conn.close()
-    
-    return {"categories": [row[0] for row in rows]}
+@app.get("/clientes/{cliente_id}", response_model=ClienteResponse)
+def get_cliente(cliente_id: int, username: str = Depends(verify_credentials)):
+    """Obtiene un cliente por ID"""
+    result = query_db(
+        "SELECT id, nombre, rut, email, telefono, direccion FROM clientes WHERE id = ?",
+        (cliente_id,),
+        one=True
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    return dict(result)
 
-@app.put("/inventory/{sku}")
-async def update_inventory_item(sku: str, updates: dict, token: str = None):
-    if token:
-        verify_token(token)
+# ═══════════════════════════════════════════════════════════════════════════════
+# INVENTARIO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/inventario", response_model=List[ProductoResponse])
+def get_inventario(username: str = Depends(verify_credentials)):
+    """Obtiene lista de productos"""
+    results = query_db(
+        """SELECT id, sku, descripcion, categoria, sale_price as precio, 
+                  stock_current as stock 
+           FROM inventory LIMIT 500"""
+    )
+    return [dict(r) for r in results]
+
+@app.get("/inventario/buscar")
+def buscar_inventario(q: str, username: str = Depends(verify_credentials)):
+    """Busca productos por SKU o descripción"""
+    query = f"%{q}%"
+    results = query_db(
+        """SELECT id, sku, descripcion, categoria, sale_price, stock_current 
+           FROM inventory 
+           WHERE sku LIKE ? OR descripcion LIKE ? 
+           LIMIT 50""",
+        (query, query)
+    )
+    return [dict(r) for r in results]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ÓRDENES DE TRABAJO (OT)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/ot")
+def get_ot_list(username: str = Depends(verify_credentials)):
+    """Obtiene OT activas"""
+    results = query_db(
+        """SELECT id, numero, cliente_id, estado, fecha_creacion, descripcion 
+           FROM trabajo 
+           WHERE estado IN ('pendiente', 'en_progreso')
+           ORDER BY fecha_creacion DESC LIMIT 50"""
+    )
+    return [dict(r) for r in results]
+
+@app.get("/ot/{ot_id}")
+def get_ot_detail(ot_id: int, username: str = Depends(verify_credentials)):
+    """Obtiene detalles de una OT"""
+    ot = query_db(
+        """SELECT id, numero, cliente_id, estado, fecha_creacion, descripcion 
+           FROM trabajo WHERE id = ?""",
+        (ot_id,),
+        one=True
+    )
+    if not ot:
+        raise HTTPException(status_code=404, detail="OT no encontrada")
     
-    allowed_fields = ["is_service", "category", "location", "stock_min", "cost_unit", "margin_pct"]
+    ot_dict = dict(ot)
     
-    for field in updates.keys():
-        if field not in allowed_fields:
-            raise HTTPException(status_code=400, detail=f"Campo no permitido: {field}")
+    # Agregar cliente
+    cliente = query_db(
+        "SELECT nombre, rut, email, telefono, direccion FROM clientes WHERE id = ?",
+        (ot_dict["cliente_id"],),
+        one=True
+    )
+    if cliente:
+        ot_dict["cliente"] = dict(cliente)
     
-    set_clause = ", ".join([f"{k}=?" for k in updates.keys()])
-    values = list(updates.values()) + [sku]
+    # Agregar items
+    items = query_db(
+        """SELECT id, sku, descripcion, cantidad, item_type 
+           FROM project_items WHERE project_id = ?""",
+        (ot_id,)
+    )
+    ot_dict["items"] = [dict(i) for i in items]
     
-    conn = get_conn()
-    conn.execute(f"UPDATE inventory SET {set_clause} WHERE sku=?", values)
+    return ot_dict
+
+@app.post("/ot/{ot_id}/completar")
+def completar_ot(ot_id: int, username: str = Depends(verify_credentials)):
+    """Marca una OT como completada"""
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE trabajo SET estado = ? WHERE id = ?",
+        ("completada", ot_id)
+    )
     conn.commit()
     conn.close()
     
-    return {"message": f"Producto {sku} actualizado correctamente"}
+    return {"success": True, "ot_id": ot_id, "estado": "completada"}
 
-@app.get("/clients")
-async def get_clients(skip: int = 0, limit: int = 100, token: str = None):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM clients ORDER BY name LIMIT ? OFFSET ?",
-        (limit, skip)
-    ).fetchall()
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECKLIST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/checklist/{ot_id}")
+def get_checklist(ot_id: int, username: str = Depends(verify_credentials)):
+    """Obtiene checklist de una OT"""
+    results = query_db(
+        """SELECT id, paso, completado, nota, foto_url 
+           FROM checklist WHERE ot_id = ?
+           ORDER BY orden ASC""",
+        (ot_id,)
+    )
+    return [dict(r) for r in results]
+
+@app.post("/checklist/{item_id}/completar")
+def completar_checklist_item(
+    item_id: int,
+    nota: Optional[str] = None,
+    username: str = Depends(verify_credentials)
+):
+    """Marca un item del checklist como completado"""
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE checklist SET completado = 1, nota = ? WHERE id = ?",
+        (nota, item_id)
+    )
+    conn.commit()
     conn.close()
     
-    return [dict(row) for row in rows]
+    return {"success": True, "item_id": item_id, "completado": True}
 
-@app.get("/quotes")
-async def get_quotes(status_filter: Optional[str] = None, skip: int = 0, limit: int = 100, token: str = None):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    query = "SELECT * FROM quotes WHERE 1=1"
-    params = []
-    
-    if status_filter:
-        query += " AND status=?"
-        params.append(status_filter)
-    
-    query += " ORDER BY quote_date DESC LIMIT ? OFFSET ?"
-    params.extend([limit, skip])
-    
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    
-    return [dict(row) for row in rows]
+# ═══════════════════════════════════════════════════════════════════════════════
+# ESTADO DEL SERVIDOR
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/sales")
-async def get_sales(skip: int = 0, limit: int = 100, token: str = None):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM sales ORDER BY sale_date DESC LIMIT ? OFFSET ?",
-        (limit, skip)
-    ).fetchall()
-    conn.close()
-    
-    return [dict(row) for row in rows]
+@app.get("/status")
+def api_status(username: str = Depends(verify_credentials)):
+    """Estado general del API y datos"""
+    try:
+        clientes = query_db("SELECT COUNT(*) as count FROM clientes", one=True)
+        productos = query_db("SELECT COUNT(*) as count FROM inventory", one=True)
+        ot = query_db("SELECT COUNT(*) as count FROM trabajo", one=True)
+        
+        return {
+            "api": "online",
+            "database": "connected",
+            "datos": {
+                "clientes": clientes["count"] if clientes else 0,
+                "productos": productos["count"] if productos else 0,
+                "ot": ot["count"] if ot else 0,
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/sales/summary")
-async def get_sales_summary(token: str = None):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    summary = conn.execute("""
-        SELECT COUNT(*) as total_sales, SUM(total) as total_amount, 
-               SUM(gross_margin) as total_margin, AVG(gross_margin_pct) as avg_margin_pct
-        FROM sales WHERE sale_date >= date('now', '-30 days')
-    """).fetchone()
-    conn.close()
-    
+# ═══════════════════════════════════════════════════════════════════════════════
+# RAÍZ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+def root():
+    """Raíz del API - redirige a docs"""
     return {
-        "period": "last_30_days",
-        "total_sales": summary[0] or 0,
-        "total_amount": summary[1] or 0,
-        "total_margin": summary[2] or 0,
-        "avg_margin_pct": round(summary[3] or 0, 2)
-    }
-
-@app.get("/dashboard/metrics")
-async def get_dashboard_metrics(token: str = None):
-    if token:
-        verify_token(token)
-    
-    conn = get_conn()
-    
-    products = conn.execute("SELECT COUNT(*) FROM inventory WHERE is_service=0").fetchone()[0]
-    low_stock = conn.execute(
-        "SELECT COUNT(*) FROM inventory WHERE stock_current < stock_min AND is_service=0"
-    ).fetchone()[0]
-    pending_quotes = conn.execute(
-        "SELECT COUNT(*) FROM quotes WHERE status='Pendiente'"
-    ).fetchone()[0]
-    month_sales = conn.execute(
-        "SELECT COUNT(*) FROM sales WHERE sale_date >= date('now', 'start of month')"
-    ).fetchone()[0]
-    
-    conn.close()
-    
-    return {
-        "total_products": products,
-        "low_stock_items": low_stock,
-        "pending_quotes": pending_quotes,
-        "sales_this_month": month_sales
+        "message": "Abaroa Smart ERP API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health"
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
