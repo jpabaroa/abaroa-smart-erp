@@ -7,22 +7,34 @@ Autenticación JWT | CORS habilitado | Documentación automática en /docs
 """
 
 from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import jwt
 import os
 from typing import List, Optional
-from database import (
-    get_conn, verify_admin_credentials, hash_password, get_setting,
-    save_inventory_image
-)
+from database import get_conn, verify_admin_credentials
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Abaroa Smart ERP API",
     description="API REST para aplicaciones móviles (iOS/Android)",
+    version="2.0.0",
+)
+
+# CORS - Permitir acceso desde apps móviles
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# JWT Configuration
+SECRET_KEY = os.environ.get("JWT_SECRET", "your-secret-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
     version="2.0.0",
 )
 
@@ -61,6 +73,8 @@ class HealthResponse(BaseModel):
 
 # ── JWT FUNCTIONS ─────────────────────────────────────────────────────────────
 
+# ── JWT FUNCTIONS ─────────────────────────────────────────────────────────────
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
@@ -70,20 +84,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
-
-def verify_token(credentials: HTTPAuthCredentials = Depends(security)):
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
-        return username
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expirado")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
-
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 
 @app.get("/", response_model=HealthResponse)
