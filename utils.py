@@ -23,6 +23,10 @@ import streamlit as st
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
+import smtplib
+import ssl
+import urllib.parse
+from email.message import EmailMessage
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -912,3 +916,62 @@ def make_pdf(title, subtitle="", sections=None):
         y -= 8
     c.save(); buffer.seek(0)
     return buffer.getvalue()
+
+# ── Envío: WhatsApp y Email ──────────────────────────────────────────────────
+def whatsapp_share_link(phone, message):
+    """Genera un link wa.me con mensaje pre-armado. No adjunta archivos
+    (WhatsApp no lo permite vía link) — el PDF se descarga aparte y se
+    adjunta manualmente al abrir el chat."""
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if not digits:
+        return None
+    if not digits.startswith("56") and len(digits) <= 9:
+        digits = "56" + digits.lstrip("0")
+    text = urllib.parse.quote(message)
+    return f"https://wa.me/{digits}?text={text}"
+
+
+def send_quote_email(to_email, subject, body_text, pdf_bytes, pdf_filename):
+    """Envía la cotización por correo con el PDF adjunto usando SMTP.
+    Requiere credenciales en .streamlit/secrets.toml:
+
+        [smtp]
+        host = "smtp.gmail.com"
+        port = 465
+        user = "contacto@abaroasmart.com"
+        password = "..."   # contraseña de aplicación, no la contraseña normal
+        from_name = "Abaroa Smart"
+
+    Retorna (ok: bool, mensaje: str).
+    """
+    try:
+        cfg = st.secrets.get("smtp", {})
+    except Exception:
+        cfg = {}
+    host = cfg.get("host", "")
+    port = int(cfg.get("port", 465))
+    user = cfg.get("user", "")
+    password = cfg.get("password", "")
+    from_name = cfg.get("from_name", "Abaroa Smart")
+
+    if not (host and user and password):
+        return False, ("Envío de correo no configurado. Agrega [smtp] host/port/user/password "
+                        "en Streamlit → Settings → Secrets.")
+    if not to_email:
+        return False, "El cliente no tiene correo registrado."
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{from_name} <{user}>"
+    msg["To"] = to_email
+    msg.set_content(body_text)
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_filename)
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=context) as server:
+            server.login(user, password)
+            server.send_message(msg)
+        return True, f"Correo enviado a {to_email}."
+    except Exception as e:
+        return False, f"Error al enviar correo: {e}"

@@ -39,47 +39,11 @@ if "sidebar_open"    not in st.session_state: st.session_state["sidebar_open"]  
 if "global_search"   not in st.session_state: st.session_state["global_search"]   = ""
 if "admin_logged_in" not in st.session_state: st.session_state["admin_logged_in"] = False
 
-# ── Login obligatorio ─────────────────────────────────────────────────────────
-def render_login_screen():
-    """Pantalla de login de pantalla completa. Bloquea el acceso a todo el ERP
-    hasta que se ingresen credenciales válidas."""
-    st.markdown("""
-    <style>
-    [data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none !important; }
-    .block-container { padding-top: 3rem; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    c1, c2, c3 = st.columns([1, 1.1, 1])
-    with c2:
-        st.markdown("<div style='height:3rem'></div>", unsafe_allow_html=True)
-        logo(width=180)
-        st.markdown(
-            "<div style='text-align:center; opacity:.7; margin:0.5rem 0 1.5rem;'>"
-            "Ingresa tus credenciales para continuar</div>",
-            unsafe_allow_html=True,
-        )
-        with st.form("login_form"):
-            lu = st.text_input("Usuario")
-            lp = st.text_input("Contraseña", type="password")
-            submitted = st.form_submit_button("Ingresar", use_container_width=True, type="primary")
-            if submitted:
-                if verify_admin_credentials(lu, lp):
-                    st.session_state["admin_logged_in"] = True
-                    st.rerun()
-                else:
-                    st.error("Usuario o contraseña incorrectos.")
-
-
-if not admin_logged_in():
-    render_login_screen()
-    st.stop()
-
-
 # ── CSS sidebar open/close ────────────────────────────────────────────────────
-# FIX: usar st.markdown() en lugar de st.html() para que los estilos apliquen
-# globalmente. st.html() en Streamlit ≥1.36 renderiza en un <iframe> aislado
-# y el CSS nunca sale de ese iframe.
+# FIX: usar components.html() con JS → window.parent.document, NO
+# st.markdown(unsafe_allow_html=True): ese método filtra/elimina las etiquetas
+# <style> en Streamlit ≥1.38, lo que dejaba el sidebar nativo (vacío, expandido)
+# tapando la pantalla de login en mobile y sin botón para colapsarlo.
 
 def inject_sidebar_css(open_: bool = True):
     """
@@ -133,6 +97,23 @@ def inject_sidebar_css(open_: bool = True):
             font-size:0 !important;
         }
         """
+    elif open_ is None:
+        # Modo "login": sidebar completamente oculto y sin botón de colapsar,
+        # a cualquier resolución. No hay nada útil en el sidebar antes de
+        # autenticarse.
+        css = """
+        [data-testid="collapsedControl"],
+        button[data-testid="collapsedControl"] {
+            display:none !important; visibility:hidden !important;
+        }
+        section[data-testid="stSidebar"] {
+            display:none !important;
+            width:0 !important; min-width:0 !important; max-width:0 !important;
+            transform:translateX(-110%) !important;
+            opacity:0 !important; visibility:hidden !important;
+        }
+        [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
+        """
     else:
         css = """
         @media (min-width: 769px) {
@@ -185,10 +166,45 @@ def inject_sidebar_css(open_: bool = True):
     )
 
 
+# ── Login obligatorio ─────────────────────────────────────────────────────────
+def render_login_screen():
+    """Pantalla de login de pantalla completa. Bloquea el acceso a todo el ERP
+    hasta que se ingresen credenciales válidas."""
+    inject_sidebar_css(None)  # oculta el sidebar con el método probado (JS), no st.markdown
+
+    c1, c2, c3 = st.columns([1, 1.1, 1])
+    with c2:
+        st.markdown("<div style='height:3rem'></div>", unsafe_allow_html=True)
+        logo(width=180)
+        st.markdown(
+            "<div style='text-align:center; opacity:.7; margin:0.5rem 0 1.5rem;'>"
+            "Ingresa tus credenciales para continuar</div>",
+            unsafe_allow_html=True,
+        )
+        with st.form("login_form"):
+            lu = st.text_input("Usuario")
+            lp = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button("Ingresar", use_container_width=True, type="primary")
+            if submitted:
+                if verify_admin_credentials(lu, lp):
+                    st.session_state["admin_logged_in"] = True
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+
+
+if not admin_logged_in():
+    render_login_screen()
+    st.stop()
+
 inject_sidebar_css(st.session_state.get("sidebar_open", True))
 
 
-# ── HEADER ────────────────────────────────────────────────────────────────────
+# ── HEADER ────────────────────────────────────────────────────────────────────# ── CSS sidebar open/close ────────────────────────────────────────────────────
+# FIX: usar st.markdown() en lugar de st.html() para que los estilos apliquen
+# globalmente. st.html() en Streamlit ≥1.36 renderiza en un <iframe> aislado
+# y el CSS nunca sale de ese iframe.
+
 def render_header():
     current_tab = st.session_state["current_tab"]
     h1, h2, h3, h4, h5 = st.columns([0.5, 3.2, 6, 0.65, 0.65])
@@ -260,7 +276,7 @@ def render_sidebar():
     nav = {
         "Principal":  [("Inicio","🏠 Inicio"), ("Flujo Guiado","🧭 Flujo Guiado"), ("Buscador","🔎 Buscador")],
         "Operación":  [("Proyectos","🛠️ Proyectos"), ("OT","📋 OT"), ("Garantías","🛡️ Garantías")],
-        "Comercial":  [("Cotización","🧾 Cotización"), ("Historial Cotizaciones","📚 Historial"),
+        "Comercial":  [("Levantamiento","🔍 Levantamiento"), ("Cotización","🧾 Cotización"), ("Historial Cotizaciones","📚 Historial"),
                        ("Ventas","💳 Ventas"), ("Facturación","🧮 Facturación")],
         "Inventario": [("Inventario","📦 Inventario"), ("Herramientas","🔧 Herramientas"),
                        ("Insumos","🧰 Insumos"), ("Kits","🧩 Kits"), ("Proveedores","🚚 Proveedores")],
@@ -295,6 +311,7 @@ _views = {
     "Inicio":                   "views.inicio",
     "Flujo Guiado":             "views.flujo",
     "Buscador":                 "views.buscador",
+    "Levantamiento":            "views.levantamiento",
     "Cotización":               "views.cotizacion",
     "Historial Cotizaciones":   "views.historial_cotizaciones",
     "Ventas":                   "views.ventas",

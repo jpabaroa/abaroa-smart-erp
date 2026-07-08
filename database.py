@@ -196,6 +196,30 @@ CREATE TABLE IF NOT EXISTS checklist_template_items (
     item_text TEXT NOT NULL, is_required INTEGER DEFAULT 1,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS site_surveys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id INTEGER NOT NULL,
+    survey_date TEXT DEFAULT (date('now')),
+    address TEXT DEFAULT '',
+    technician TEXT DEFAULT '',
+    status TEXT DEFAULT 'Pendiente',
+    general_notes TEXT DEFAULT '',
+    quote_id INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS site_survey_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    survey_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    sku TEXT DEFAULT '',
+    item_type TEXT DEFAULT 'producto',
+    quantity INTEGER DEFAULT 1,
+    zone TEXT DEFAULT '',
+    technical_notes TEXT DEFAULT '',
+    unit_price INTEGER DEFAULT 0,
+    photo_path TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 def init_db():
@@ -408,6 +432,138 @@ def kit_components_df(kit_id):
         FROM kit_items ki LEFT JOIN inventory i ON i.sku=ki.sku
         WHERE ki.kit_id=? ORDER BY ki.id
     """, (kit_id,))
+
+# ── Levantamiento en terreno ─────────────────────────────────────────────────
+def save_survey_photo(image_file, survey_id, item_key):
+    """Guarda la foto de un ítem del levantamiento. item_key puede ser un id
+    real o un valor temporal (ej. índice de fila) mientras el ítem no se ha
+    guardado en la BD todavía."""
+    try:
+        img_dir = APP_DIR / "static" / "survey_photos" / str(survey_id)
+        img_dir.mkdir(parents=True, exist_ok=True)
+        ext = Path(image_file.name).suffix or ".jpg"
+        dest = img_dir / f"{item_key}{ext}"
+        dest.write_bytes(image_file.read())
+        return str(dest.relative_to(APP_DIR))
+    except Exception:
+        return ""
+
+def survey_photo_web_path(photo_path):
+    if not photo_path:
+        return None
+    full = APP_DIR / photo_path
+    return str(full) if full.exists() else None
+
+def create_survey(client_id, address="", technician="", notes=""):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO site_surveys (client_id, address, technician, general_notes) VALUES (?,?,?,?)",
+        (client_id, address.strip(), technician.strip(), notes.strip())
+    )
+    conn.commit()
+    sid = cur.lastrowid
+    conn.close()
+    return sid
+
+def update_survey_header(survey_id, address="", technician="", notes="", status=None):
+    conn = get_conn()
+    if status:
+        conn.execute(
+            "UPDATE site_surveys SET address=?,technician=?,general_notes=?,status=? WHERE id=?",
+            (address.strip(), technician.strip(), notes.strip(), status, survey_id)
+        )
+    else:
+        conn.execute(
+            "UPDATE site_surveys SET address=?,technician=?,general_notes=? WHERE id=?",
+            (address.strip(), technician.strip(), notes.strip(), survey_id)
+        )
+    conn.commit()
+    conn.close()
+
+def add_survey_item(survey_id, category, sku="", item_type="producto", quantity=1,
+                     zone="", technical_notes="", unit_price=0, photo_path=""):
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO site_survey_items
+           (survey_id, category, sku, item_type, quantity, zone, technical_notes, unit_price, photo_path)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (survey_id, category.strip(), sku.strip(), item_type, int(quantity),
+         zone.strip(), technical_notes.strip(), int(unit_price), photo_path)
+    )
+    conn.commit()
+    item_id = cur.lastrowid
+    conn.close()
+    return item_id
+
+def delete_survey_item(item_id):
+    conn = get_conn()
+    q(conn, "DELETE FROM site_survey_items WHERE id=?", (item_id,))
+    conn.close()
+
+def get_survey_items_df(survey_id):
+    return get_df(
+        "SELECT * FROM site_survey_items WHERE survey_id=? ORDER BY id", (survey_id,)
+    )
+
+def get_surveys_df(client_id=None):
+    if client_id:
+        return get_df("""
+            SELECT s.*, c.name AS client_name FROM site_surveys s
+            LEFT JOIN clients c ON c.id=s.client_id
+            WHERE s.client_id=? ORDER BY s.id DESC
+        """, (client_id,))
+    return get_df("""
+        SELECT s.*, c.name AS client_name FROM site_surveys s
+        LEFT JOIN clients c ON c.id=s.client_id ORDER BY s.id DESC
+    """)
+
+def get_survey(survey_id):
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT s.*, c.name AS client_name, c.phone AS client_phone, c.email AS client_email
+        FROM site_surveys s LEFT JOIN clients c ON c.id=s.client_id
+        WHERE s.id=?
+    """, (survey_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def build_quote_lines_from_survey(survey_id):
+    """Convierte los ítems de un levantamiento en las estructuras que usa el
+    módulo de Cotización (quote_products / quote_services / quote_supplies).
+    Ítems con SKU real de `inventory` se tratan como producto o servicio según
+    corresponda; ítems sin SKU (categoría nueva escrita en terreno) se agregan
+    como insumo con precio manual."""
+    items = get_survey_items_df(survey_id)
+    product_lines, service_lines, supply_lines = [], [], []
+    for _, it in items.iterrows():
+        sku = str(it.get("sku","") or "")
+        qty = int(it.get("quantity",1) or 1)
+        if sku:
+            inv = get_df("SELECT * FROM inventory WHERE sku=?", (sku,))
+            if not inv.empty:
+                row = inv.iloc[0]
+                price = int(row.get("sale_price",0) or 0)
+                line = {
+                    "sku": sku, "description": str(row.get("description", it["category"])),
+                    "quantity": qty, "unit_price": price, "line_total": qty * price,
+                }
+                if bool(row.get("is_service", 0)):
+                    service_lines.append(line)
+                else:
+                    product_lines.append(line)
+                continue
+        # Sin SKU o SKU no encontrado → línea de insumo con precio manual
+        price = int(it.get("unit_price", 0) or 0)
+        supply_lines.append({
+            "sku": "INSUMO", "description": str(it["category"]),
+            "quantity": qty, "unit_price": price, "line_total": qty * price,
+        })
+    return product_lines, service_lines, supply_lines
+
+def link_survey_to_quote(survey_id, quote_id):
+    conn = get_conn()
+    q(conn, "UPDATE site_surveys SET quote_id=?, status='Cotizado' WHERE id=?", (quote_id, survey_id))
+    conn.close()
 
 # ── Cotizaciones ───────────────────────────────────────────────────────────────
 def save_quote(quote_number, quote_date, client_id, vendor_id, validity_days,
