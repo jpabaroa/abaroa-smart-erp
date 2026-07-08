@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Backups locales
+backups/
+
+# Carpetas accidentales de Windows
+-p/
+
+# Secrets / config local
+.streamlit/secrets.toml
+.env
