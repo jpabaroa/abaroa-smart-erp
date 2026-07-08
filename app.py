@@ -34,9 +34,47 @@ recalc_all_sale_prices()
 recalc_stock()
 
 # ── Session state ─────────────────────────────────────────────────────────────
-if "current_tab"   not in st.session_state: st.session_state["current_tab"]   = "Inicio"
-if "sidebar_open"  not in st.session_state: st.session_state["sidebar_open"]  = True
-if "global_search" not in st.session_state: st.session_state["global_search"] = ""
+if "current_tab"     not in st.session_state: st.session_state["current_tab"]     = "Inicio"
+if "sidebar_open"    not in st.session_state: st.session_state["sidebar_open"]    = True
+if "global_search"   not in st.session_state: st.session_state["global_search"]   = ""
+if "admin_logged_in" not in st.session_state: st.session_state["admin_logged_in"] = False
+
+# ── Login obligatorio ─────────────────────────────────────────────────────────
+def render_login_screen():
+    """Pantalla de login de pantalla completa. Bloquea el acceso a todo el ERP
+    hasta que se ingresen credenciales válidas."""
+    st.markdown("""
+    <style>
+    [data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none !important; }
+    .block-container { padding-top: 3rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns([1, 1.1, 1])
+    with c2:
+        st.markdown("<div style='height:3rem'></div>", unsafe_allow_html=True)
+        logo(width=180)
+        st.markdown(
+            "<div style='text-align:center; opacity:.7; margin:0.5rem 0 1.5rem;'>"
+            "Ingresa tus credenciales para continuar</div>",
+            unsafe_allow_html=True,
+        )
+        with st.form("login_form"):
+            lu = st.text_input("Usuario")
+            lp = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button("Ingresar", use_container_width=True, type="primary")
+            if submitted:
+                if verify_admin_credentials(lu, lp):
+                    st.session_state["admin_logged_in"] = True
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+
+
+if not admin_logged_in():
+    render_login_screen()
+    st.stop()
+
 
 # ── CSS sidebar open/close ────────────────────────────────────────────────────
 # FIX: usar st.markdown() en lugar de st.html() para que los estilos apliquen
@@ -196,24 +234,13 @@ def render_header():
 
     with h5:
         with st.popover("👤", use_container_width=True):
-            if admin_logged_in():
-                st.success(f"**{get_setting('admin_username','admin')}**")
-                if st.button("Panel admin", key="hdr_admin_go"):
-                    st.session_state["current_tab"] = "Administración"
-                    st.rerun()
-                if st.button("Cerrar sesión", key="hdr_logout"):
-                    st.session_state["admin_logged_in"] = False
-                    st.rerun()
-            else:
-                pu = st.text_input("Usuario",    key="hdr_user")
-                pp = st.text_input("Contraseña", type="password", key="hdr_pass")
-                if st.button("Ingresar", key="hdr_login"):
-                    if verify_admin_credentials(pu, pp):
-                        st.session_state["admin_logged_in"] = True
-                        st.rerun()
-                    else:
-                        st.error("Credenciales incorrectas.")
-                st.caption("Default: admin / admin123")
+            st.success(f"**{get_setting('admin_username','admin')}**")
+            if st.button("Panel admin", key="hdr_admin_go"):
+                st.session_state["current_tab"] = "Administración"
+                st.rerun()
+            if st.button("Cerrar sesión", key="hdr_logout"):
+                st.session_state["admin_logged_in"] = False
+                st.rerun()
 
     # Breadcrumb
     st.markdown(f"""
