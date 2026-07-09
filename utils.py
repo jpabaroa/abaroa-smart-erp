@@ -102,25 +102,18 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
     #060d1a !important;
 }
 
-header[data-testid="stHeader"] { display:none !important; }
 [data-testid="stToolbar"]       { display:none !important; }
 #MainMenu, footer               { visibility:hidden !important; }
 
-/* ── Ocultar botón nativo de colapso de sidebar ───────────────────────────
-   Se usa un enfoque nuclear (múltiples propiedades) porque display:none solo
-   puede ser sobreescrito por CSS de Streamlit con mayor especificidad.    */
-[data-testid="collapsedControl"],
-button[data-testid="collapsedControl"],
-[data-testid="stSidebar"] [data-testid="collapsedControl"] {
-  display:         none        !important;
-  visibility:      hidden      !important;
-  opacity:         0           !important;
-  pointer-events:  none        !important;
-  height:          0           !important;
-  width:           0           !important;
-  overflow:        hidden      !important;
-  position:        absolute    !important;
-  font-size:       0           !important;
+/* NOTA: NO se oculta header[data-testid="stHeader"] ni collapsedControl.
+   El header nativo de Streamlit es donde vive la flecha para abrir/cerrar
+   el sidebar. Ocultarlo (como se hacía antes) dejaba el sidebar sin ninguna
+   forma de reabrirse una vez colapsado — ese era el bug del "menú que no
+   hace nada". Se deja el header nativo visible pero transparente para que
+   la flecha del sidebar funcione. */
+header[data-testid="stHeader"] {
+  background: transparent !important;
+  height: auto !important;
 }
 
 /* ── Ocultar texto de íconos Material en triggers de popover ─────────────

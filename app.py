@@ -19,17 +19,14 @@ from database import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# NOTA: initial_sidebar_state solo se evalúa en la PRIMERA carga de la sesión
-# del navegador — no se re-aplica en cada st.rerun(), así que NO puede
-# depender de session_state["admin_logged_in"] (cambia recién DESPUÉS del
-# primer render y ya no tiene efecto). Se deja fijo en "collapsed": es el
-# único valor que funciona bien tanto en el login (mobile) como después,
-# en escritorio y mobile por igual. Se abre con la flecha nativa de Streamlit.
+# La flecha nativa de Streamlit (en el header) abre/cierra el sidebar. Antes
+# no funcionaba porque utils.py → apply_theme() ocultaba el header nativo y el
+# collapsedControl con CSS !important; eso ya está corregido en utils.py.
 st.set_page_config(
     page_title="Abaroa Smart ERP",
     layout="wide",
     page_icon="💡",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 apply_theme()
 init_db()
@@ -90,10 +87,7 @@ def render_header():
     h1, h2, h3, h4, h5 = st.columns([0.5, 3.2, 6, 0.65, 0.65])
 
     with h1:
-        st.markdown(
-            "<div style='opacity:.5; font-size:.75rem; padding-top:.6rem;'>☰ menú</div>",
-            unsafe_allow_html=True,
-        )
+        st.write("")
 
     with h2:
         # FIX: no pasar value= junto con key= apuntando al mismo session_state.
