@@ -19,11 +19,12 @@ from database import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
+_already_logged_in = st.session_state.get("admin_logged_in", False)
 st.set_page_config(
     page_title="Abaroa Smart ERP",
     layout="wide",
     page_icon="💡",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded" if _already_logged_in else "collapsed",
 )
 apply_theme()
 init_db()
@@ -56,7 +57,7 @@ def inject_sidebar_css(open_: bool = True):
     if open_:
         css = """
         @media (min-width: 769px) {
-            [data-testid="collapsedControl"] { display:none !important; }
+            [data-testid*="ollapse" i] { display:none !important; }
             section[data-testid="stSidebar"] {
                 width:17rem !important; min-width:17rem !important;
                 transform:translateX(0) !important;
@@ -65,7 +66,7 @@ def inject_sidebar_css(open_: bool = True):
             }
         }
         @media (max-width: 768px) {
-            [data-testid="collapsedControl"] { display:none !important; }
+            [data-testid*="ollapse" i] { display:none !important; }
             section[data-testid="stSidebar"] {
                 position:fixed !important;
                 top:0 !important; left:0 !important; bottom:0 !important;
@@ -89,8 +90,8 @@ def inject_sidebar_css(open_: bool = True):
             }
         }
         /* Nuclear: ocultar botón nativo a toda resolución */
-        [data-testid="collapsedControl"],
-        button[data-testid="collapsedControl"] {
+        [data-testid*="ollapse" i],
+        button[data-testid*="ollapse" i] {
             display:none !important; visibility:hidden !important;
             opacity:0 !important; width:0 !important; height:0 !important;
             overflow:hidden !important; pointer-events:none !important;
@@ -98,12 +99,13 @@ def inject_sidebar_css(open_: bool = True):
         }
         """
     elif open_ is None:
-        # Modo "login": sidebar completamente oculto y sin botón de colapsar,
-        # a cualquier resolución. No hay nada útil en el sidebar antes de
-        # autenticarse.
+        # Modo "login": sidebar oculto + login centrado con CSS puro
+        # (evitamos st.columns(): en Streamlit las columnas se apilan
+        # verticalmente en pantallas angostas, lo que dejaba el formulario
+        # de login fuera de la vista en mobile).
         css = """
-        [data-testid="collapsedControl"],
-        button[data-testid="collapsedControl"] {
+        [data-testid*="ollapse" i],
+        button[data-testid*="ollapse" i] {
             display:none !important; visibility:hidden !important;
         }
         section[data-testid="stSidebar"] {
@@ -113,11 +115,16 @@ def inject_sidebar_css(open_: bool = True):
             opacity:0 !important; visibility:hidden !important;
         }
         [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
+        .main .block-container {
+            max-width: 420px !important;
+            margin: 0 auto !important;
+            padding-top: 3rem !important;
+        }
         """
     else:
         css = """
         @media (min-width: 769px) {
-            [data-testid="collapsedControl"] { display:none !important; }
+            [data-testid*="ollapse" i] { display:none !important; }
             section[data-testid="stSidebar"] {
                 width:0 !important; min-width:0 !important; max-width:0 !important;
                 overflow:hidden !important;
@@ -128,7 +135,7 @@ def inject_sidebar_css(open_: bool = True):
             [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
         }
         @media (max-width: 768px) {
-            [data-testid="collapsedControl"] { display:none !important; }
+            [data-testid*="ollapse" i] { display:none !important; }
             section[data-testid="stSidebar"] {
                 position:fixed !important;
                 top:0 !important; left:0 !important; bottom:0 !important;
@@ -170,27 +177,24 @@ def inject_sidebar_css(open_: bool = True):
 def render_login_screen():
     """Pantalla de login de pantalla completa. Bloquea el acceso a todo el ERP
     hasta que se ingresen credenciales válidas."""
-    inject_sidebar_css(None)  # oculta el sidebar con el método probado (JS), no st.markdown
+    inject_sidebar_css(None)  # oculta el sidebar + centra el formulario, todo vía CSS (no st.columns)
 
-    c1, c2, c3 = st.columns([1, 1.1, 1])
-    with c2:
-        st.markdown("<div style='height:3rem'></div>", unsafe_allow_html=True)
-        logo(width=180)
-        st.markdown(
-            "<div style='text-align:center; opacity:.7; margin:0.5rem 0 1.5rem;'>"
-            "Ingresa tus credenciales para continuar</div>",
-            unsafe_allow_html=True,
-        )
-        with st.form("login_form"):
-            lu = st.text_input("Usuario")
-            lp = st.text_input("Contraseña", type="password")
-            submitted = st.form_submit_button("Ingresar", use_container_width=True, type="primary")
-            if submitted:
-                if verify_admin_credentials(lu, lp):
-                    st.session_state["admin_logged_in"] = True
-                    st.rerun()
-                else:
-                    st.error("Usuario o contraseña incorrectos.")
+    logo(width=180)
+    st.markdown(
+        "<div style='text-align:center; opacity:.7; margin:0.5rem 0 1.5rem;'>"
+        "Ingresa tus credenciales para continuar</div>",
+        unsafe_allow_html=True,
+    )
+    with st.form("login_form"):
+        lu = st.text_input("Usuario")
+        lp = st.text_input("Contraseña", type="password")
+        submitted = st.form_submit_button("Ingresar", use_container_width=True, type="primary")
+        if submitted:
+            if verify_admin_credentials(lu, lp):
+                st.session_state["admin_logged_in"] = True
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos.")
 
 
 if not admin_logged_in():
