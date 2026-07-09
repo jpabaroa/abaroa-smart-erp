@@ -102,51 +102,15 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
     #060d1a !important;
 }
 
+header[data-testid="stHeader"] { display:none !important; }
 [data-testid="stToolbar"]       { display:none !important; }
 #MainMenu, footer               { visibility:hidden !important; }
 
-/* NOTA: NO se oculta header[data-testid="stHeader"] ni collapsedControl.
-   El header nativo de Streamlit es donde vive la flecha para abrir/cerrar
-   el sidebar. Ocultarlo (como se hacía antes) dejaba el sidebar sin ninguna
-   forma de reabrirse una vez colapsado — ese era el bug del "menú que no
-   hace nada". Se deja el header nativo visible pero transparente para que
-   la flecha del sidebar funcione. */
-header[data-testid="stHeader"] {
-  background: transparent !important;
-  height: auto !important;
-}
-
-/* ── Botón de REAPERTURA del sidebar: forzado siempre visible ─────────────
-   Cuando el sidebar está colapsado, Streamlit muestra un control para
-   reabrirlo dentro del header nativo. Como nuestro header custom y el
-   padding del contenido pueden taparlo/recortarlo, se fuerza a posición
-   fija, arriba a la izquierda, por encima de todo, con fondo visible.
-   Cubre los distintos data-testid usados por versiones de Streamlit.   */
+/* El sidebar de Streamlit ya NO se usa en esta app (la navegación vive en el
+   popover "☰ Menú" del header). Se oculta cualquier resto por si acaso. */
+section[data-testid="stSidebar"],
 [data-testid="stSidebarCollapsedControl"],
-[data-testid="collapsedControl"],
-[data-testid="stExpandSidebarButton"] {
-  display:        flex        !important;
-  visibility:     visible     !important;
-  opacity:        1           !important;
-  pointer-events: auto        !important;
-  position:       fixed       !important;
-  top:            .65rem      !important;
-  left:           .65rem      !important;
-  z-index:        2147483647  !important;
-  align-items:    center      !important;
-  justify-content:center      !important;
-  background:     rgba(37,99,235,.92) !important;
-  border-radius:  10px        !important;
-  box-shadow:     0 2px 10px rgba(0,0,0,.45) !important;
-}
-[data-testid="stSidebarCollapsedControl"] svg,
-[data-testid="collapsedControl"] svg,
-[data-testid="stExpandSidebarButton"] svg {
-  color: #fff !important;
-  fill:  #fff !important;
-  width: 1.3rem !important;
-  height:1.3rem !important;
-}
+[data-testid="collapsedControl"] { display:none !important; }
 
 /* ── Ocultar texto de íconos Material en triggers de popover ─────────────
    st.popover() añade un ícono "expand_more" como span hijo. Si Material

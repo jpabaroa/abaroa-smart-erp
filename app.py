@@ -19,14 +19,12 @@ from database import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# La flecha nativa de Streamlit (en el header) abre/cierra el sidebar. Antes
-# no funcionaba porque utils.py → apply_theme() ocultaba el header nativo y el
-# collapsedControl con CSS !important; eso ya está corregido en utils.py.
+# El sidebar de Streamlit NO se usa (ver nota en sección SIDEBAR: ELIMINADO).
 st.set_page_config(
     page_title="Abaroa Smart ERP",
     layout="wide",
     page_icon="💡",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 apply_theme()
 init_db()
@@ -82,12 +80,34 @@ if not admin_logged_in():
 
 
 # ── HEADER ────────────────────────────────────────────────────────────────────
+NAV = {
+    "Principal":  [("Inicio","🏠 Inicio"), ("Flujo Guiado","🧭 Flujo Guiado"), ("Buscador","🔎 Buscador")],
+    "Operación":  [("Proyectos","🛠️ Proyectos"), ("OT","📋 OT"), ("Garantías","🛡️ Garantías")],
+    "Comercial":  [("Levantamiento","🔍 Levantamiento"), ("Cotización","🧾 Cotización"), ("Historial Cotizaciones","📚 Historial"),
+                   ("Ventas","💳 Ventas"), ("Facturación","🧮 Facturación")],
+    "Inventario": [("Inventario","📦 Inventario"), ("Herramientas","🔧 Herramientas"),
+                   ("Insumos","🧰 Insumos"), ("Kits","🧩 Kits"), ("Proveedores","🚚 Proveedores")],
+    "CRM":        [("Clientes","👤 Clientes"), ("Vendedores","🤝 Vendedores")],
+    "Sistema":    [("Respaldo y Restauración","⚙️ Respaldos"), ("Administración","🔐 Admin")],
+}
+
+
 def render_header():
     current_tab = st.session_state["current_tab"]
-    h1, h2, h3, h4, h5 = st.columns([0.5, 3.2, 6, 0.65, 0.65])
+    h1, h2, h3, h4, h5 = st.columns([0.9, 3.2, 6, 0.65, 0.65])
 
     with h1:
-        st.write("")
+        # Menú de navegación completo: popover nativo de Streamlit.
+        # Sin sidebar, sin CSS custom — funciona igual en escritorio y móvil.
+        with st.popover("☰ Menú", use_container_width=True):
+            current = st.session_state.get("current_tab", "Inicio")
+            for section, items in NAV.items():
+                st.markdown(f"**{section}**")
+                for tab_key, tab_label in items:
+                    btype = "primary" if current == tab_key else "secondary"
+                    if st.button(tab_label, key=f"nav_{tab_key}", use_container_width=True, type=btype):
+                        st.session_state["current_tab"] = tab_key
+                        st.rerun()
 
     with h2:
         # FIX: no pasar value= junto con key= apuntando al mismo session_state.
@@ -142,39 +162,16 @@ def render_header():
     </div>""", unsafe_allow_html=True)
 
 
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
-def render_sidebar():
-    nav = {
-        "Principal":  [("Inicio","🏠 Inicio"), ("Flujo Guiado","🧭 Flujo Guiado"), ("Buscador","🔎 Buscador")],
-        "Operación":  [("Proyectos","🛠️ Proyectos"), ("OT","📋 OT"), ("Garantías","🛡️ Garantías")],
-        "Comercial":  [("Levantamiento","🔍 Levantamiento"), ("Cotización","🧾 Cotización"), ("Historial Cotizaciones","📚 Historial"),
-                       ("Ventas","💳 Ventas"), ("Facturación","🧮 Facturación")],
-        "Inventario": [("Inventario","📦 Inventario"), ("Herramientas","🔧 Herramientas"),
-                       ("Insumos","🧰 Insumos"), ("Kits","🧩 Kits"), ("Proveedores","🚚 Proveedores")],
-        "CRM":        [("Clientes","👤 Clientes"), ("Vendedores","🤝 Vendedores")],
-        "Sistema":    [("Respaldo y Restauración","⚙️ Respaldos"), ("Administración","🔐 Admin")],
-    }
-
-    with st.sidebar:
-        st.markdown("""
-        <div class="sidebar-brand">
-          <div class="sidebar-brand-logo">Abaroa<span>Smart</span></div>
-          <div class="sidebar-brand-sub">ERP Operativo</div>
-        </div>""", unsafe_allow_html=True)
-
-        current = st.session_state.get("current_tab", "Inicio")
-        for section, items in nav.items():
-            st.markdown(f'<div class="sidebar-section">{section}</div>', unsafe_allow_html=True)
-            for tab_key, tab_label in items:
-                btype = "primary" if current == tab_key else "secondary"
-                if st.button(tab_label, key=f"nav_{tab_key}", use_container_width=True, type=btype):
-                    st.session_state["current_tab"] = tab_key
-                    st.rerun()
+# ── SIDEBAR: ELIMINADO ────────────────────────────────────────────────────────
+# Decisión definitiva tras múltiples rondas de bugs en mobile: el sidebar de
+# Streamlit no se usa más. Toda la navegación vive en el popover "☰ Menú" del
+# header (componente nativo, mismo mecanismo que 🔔 y 👤 que siempre han
+# funcionado). Al no llamar nunca a st.sidebar, Streamlit no renderiza el
+# panel ni sus controles de colapso — no hay nada que pueda romperse.
 
 
 # ── Render ────────────────────────────────────────────────────────────────────
 render_header()
-render_sidebar()
 current_tab = st.session_state.get("current_tab", "Inicio")
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
