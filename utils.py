@@ -116,6 +116,38 @@ header[data-testid="stHeader"] {
   height: auto !important;
 }
 
+/* ── Botón de REAPERTURA del sidebar: forzado siempre visible ─────────────
+   Cuando el sidebar está colapsado, Streamlit muestra un control para
+   reabrirlo dentro del header nativo. Como nuestro header custom y el
+   padding del contenido pueden taparlo/recortarlo, se fuerza a posición
+   fija, arriba a la izquierda, por encima de todo, con fondo visible.
+   Cubre los distintos data-testid usados por versiones de Streamlit.   */
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"],
+[data-testid="stExpandSidebarButton"] {
+  display:        flex        !important;
+  visibility:     visible     !important;
+  opacity:        1           !important;
+  pointer-events: auto        !important;
+  position:       fixed       !important;
+  top:            .65rem      !important;
+  left:           .65rem      !important;
+  z-index:        2147483647  !important;
+  align-items:    center      !important;
+  justify-content:center      !important;
+  background:     rgba(37,99,235,.92) !important;
+  border-radius:  10px        !important;
+  box-shadow:     0 2px 10px rgba(0,0,0,.45) !important;
+}
+[data-testid="stSidebarCollapsedControl"] svg,
+[data-testid="collapsedControl"] svg,
+[data-testid="stExpandSidebarButton"] svg {
+  color: #fff !important;
+  fill:  #fff !important;
+  width: 1.3rem !important;
+  height:1.3rem !important;
+}
+
 /* ── Ocultar texto de íconos Material en triggers de popover ─────────────
    st.popover() añade un ícono "expand_more" como span hijo. Si Material
    Symbols no carga o la fuente es sobreescrita, muestra texto literal.
