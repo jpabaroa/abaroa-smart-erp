@@ -5,7 +5,7 @@ Entry point: configuración, tema premium, sidebar y despachador de vistas.
 CORRECCIONES v3:
   - Se abandonó el control custom del sidebar via CSS inyectado (perdía la
     guerra de especificidad contra el CSS interno de Streamlit en mobile).
-    Ahora se usa el comportamiento nativo + initial_sidebar_state dinámico.
+    Ahora se usa el comportamiento nativo + initial_sidebar_state="collapsed" fijo.
   - render_header: eliminado parámetro value= en st.text_input que causaba
     StreamlitAPIException cuando global_search ya existía en session_state
 """
@@ -19,12 +19,17 @@ from database import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-_already_logged_in = st.session_state.get("admin_logged_in", False)
+# NOTA: initial_sidebar_state solo se evalúa en la PRIMERA carga de la sesión
+# del navegador — no se re-aplica en cada st.rerun(), así que NO puede
+# depender de session_state["admin_logged_in"] (cambia recién DESPUÉS del
+# primer render y ya no tiene efecto). Se deja fijo en "collapsed": es el
+# único valor que funciona bien tanto en el login (mobile) como después,
+# en escritorio y mobile por igual. Se abre con la flecha nativa de Streamlit.
 st.set_page_config(
     page_title="Abaroa Smart ERP",
     layout="wide",
     page_icon="💡",
-    initial_sidebar_state="expanded" if _already_logged_in else "collapsed",
+    initial_sidebar_state="collapsed",
 )
 apply_theme()
 init_db()
